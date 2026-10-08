@@ -1,0 +1,5 @@
+/Tests/*
+!/Tests/.gitkeep
+/Templates/*
+!/Templates/mastertemplate.json
+/Tools/*.xlsx

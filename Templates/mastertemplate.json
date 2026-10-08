@@ -1,0 +1,150 @@
+{
+  "type": "Microsoft.Network/frontDoorWebApplicationFirewallPolicies",
+  "name": "mastertemplate",
+  "location": "Global",
+  "tags": {},
+  "sku": {
+    "name": "Premium_AzureFrontDoor"
+  },
+  "properties": {
+    "policySettings": {
+      "enabledState": "Enabled",
+      "mode": "Prevention",
+      "requestBodyCheck": "Enabled",
+      "javascriptChallengeExpirationInMinutes": 30,
+      "captchaExpirationInMinutes": 30
+    },
+    "customRules": {
+      "rules": []
+    },
+    "managedRules": {
+      "managedRuleSets": [
+        {
+          "ruleSetType": "Microsoft_DefaultRuleSet",
+          "ruleSetVersion": "2.1",
+          "ruleSetAction": "Block",
+          "ruleGroupOverrides": [
+            {
+              "ruleGroupName": "SQLI",
+              "rules": [
+                {
+                  "ruleId": "942450",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                },
+                {
+                  "ruleId": "942440",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                },
+                {
+                  "ruleId": "942210",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                }
+              ],
+              "exclusions": []
+            },
+            {
+              "ruleGroupName": "XSS",
+              "rules": [
+                {
+                  "ruleId": "941100",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                },
+                {
+                  "ruleId": "941120",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                },
+                {
+                  "ruleId": "941180",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                }
+              ],
+              "exclusions": []
+            },
+            {
+              "ruleGroupName": "LFI",
+              "rules": [
+                {
+                  "ruleId": "930120",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                }
+              ],
+              "exclusions": []
+            },
+            {
+              "ruleGroupName": "RCE",
+              "rules": [
+                {
+                  "ruleId": "932150",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                }
+              ],
+              "exclusions": []
+            },
+            {
+              "ruleGroupName": "JAVA",
+              "rules": [
+                {
+                  "ruleId": "944120",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                }
+              ],
+              "exclusions": []
+            },
+            {
+              "ruleGroupName": "MS-ThreatIntel-WebShells",
+              "rules": [
+                {
+                  "ruleId": "99005002",
+                  "enabledState": "Enabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                },
+                {
+                  "ruleId": "99005006",
+                  "enabledState": "Disabled",
+                  "action": "AnomalyScoring",
+                  "exclusions": []
+                }
+              ],
+              "exclusions": []
+            }
+          ],
+          "exclusions": []
+        },
+        {
+          "ruleSetType": "Microsoft_BotManagerRuleSet",
+          "ruleSetVersion": "1.0",
+          "ruleGroupOverrides": [],
+          "exclusions": []
+        },
+        {
+          "ruleSetType": "Microsoft_HTTPDDoSRuleSet",
+          "ruleSetVersion": "1.0",
+          "ruleGroupOverrides": [],
+          "exclusions": []
+        }
+      ],
+      "exceptionsList": {
+        "exceptions": []
+      }
+    }
+  }
+}

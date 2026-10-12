@@ -1,7 +1,7 @@
 # Front Door WAF policy migration
 
-[`New-WafMigrationTemplate.ps1`](New-WafMigrationTemplate.ps1) reads an existing
-Front Door WAF policy, compares it with a destination configuration, and asks which
+[`New-WafMigrationTemplate.ps1`](New-WafMigrationTemplate.ps1) reads a
+Front Door WAF policy from Azure or a JSON file, compares it with a destination configuration, and asks which
 settings to keep. It then writes an ARM template for a new Premium WAF policy.
 **It does not deploy or change Azure policies or Front Door associations.**
 
@@ -29,8 +29,8 @@ Microsoft_DefaultRuleSet supports **source versions 1.0, 1.1, 2.1, and 2.2** and
 and state/action defaults for all four versions; the snapshot was verified on
 2026-10-08.
 
-Comparison and validation use these local catalogs. Azure is queried only to
-read the source policy, not to download catalog definitions. Unsupported versions
+Comparison and validation use these local catalogs. Azure is queried only for
+inputs supplied as resource IDs, not to download catalog definitions. Unsupported versions
 require a catalog update in the script. Missing paranoia-level metadata is shown
 as `Not documented`.
 
@@ -58,7 +58,8 @@ This differs from a configured family whose rules simply have no overrides.
 
 ### The optional master
 
-The **master** is a local JSON file used as the initial destination configuration.
+The **master** is an optional policy used as the initial destination configuration.
+Like the source, it can be a resource ID (read live from Azure) or a local JSON file.
 
 - **With a master:** use its managed versions, overrides, exclusions, exceptions,
   custom rules, policy settings, and tags.
@@ -70,16 +71,20 @@ The **master** is a local JSON file used as the initial destination configuratio
 A family absent from both sides stays absent. Custom-only policies are supported.
 Keeping a source setting does not change the destination's ruleset version.
 
-The master must be a Premium Front Door WAF resource export or an ARM template
-with one literal WAF resource. Unresolved ARM expressions are rejected.
-If it includes Microsoft_DefaultRuleSet, that version must be 2.1 or 2.2.
+The master must use the Premium Front Door SKU and Global location.
+For either input, a JSON file must contain a resource object or an ARM template
+with exactly one literal Front Door WAF resource. Unresolved ARM expressions
+are rejected; ARM-escaped literals are decoded. Files are used as snapshots;
+an `id` field inside a JSON file does not trigger an Azure read.
+Source files must include a nonempty policy name.
+If the master includes Microsoft_DefaultRuleSet, that version must be 2.1 or 2.2.
 `DefaultRuleSet` is accepted as an alias for `Microsoft_DefaultRuleSet`.
 
 [Templates/mastertemplate.json](Templates/mastertemplate.json) is a sanitized example. It retains the original
 managed versions and rule state/action overrides, but removes customer identifiers,
 custom rules, exclusions, exceptions, log-scrubbing selectors, and custom responses.
 Adapt it to your needs; it is not equivalent to the original policy.
-Other files in `Templates`, test contents, and reports are ignored by Git.
+Other files in `Templates` and generated test data/reports are ignored by Git.
 
 ### Checks and comparisons
 
@@ -90,8 +95,9 @@ The script reviews:
   conditions, rule type, and rate-limit settings.
 - **Managed rules:** matched by group/rule ID; differences in effective state,
   action, sensitivity, and protection caused by version or override changes.
-- **DRS exclusions and exceptions:** criteria and scopes, including exclusions
-  for the entire ruleset, a group, or a specific rule.
+- **DRS exclusions:** field selectors at ruleset, group, or individual-rule scope.
+- **Request exceptions (Preview):** complete request predicates and their scopes,
+  independently reviewed for DRS, Bot Manager, and HTTP DDoS.
 
 It validates supported fields, catalog identities, scopes, and custom priorities
 before writing the selected configuration.
@@ -108,11 +114,64 @@ Comparison rules:
   defaults. Mapped replacements and Bot/HTTP presence differences can require choices.
 - Exclusion rows compare membership only. Identical entries at the same scope
   are omitted from the report and preserved in the output.
+- Exception rows also compare membership. Each complete exception is one choice,
+  including all its scopes; a changed predicate or scope yields separate source-only
+  and target-only rows. Identical occurrences are paired one-to-one and preserved.
+
+### Front Door request exceptions (Preview)
+
+[Request exceptions](https://learn.microsoft.com/en-us/azure/web-application-firewall/afds/front-door-exceptions)
+are **not exclusions**. An exclusion omits selected field values from inspection.
+An exception bypasses inspection of the **matching request**, but only for its
+listed managed rules, groups, or entire rulesets. Other scopes still inspect it.
+
+The script reads and writes `properties.managedRules.exceptionsList.exceptions`
+from either live policy IDs or JSON inputs. It supports:
+
+- `RequestUri`, with exact, partial, or API-supported `EqualsAny` matching.
+- `SocketAddr`, with `IPMatch` and literal IPv4/IPv6 addresses or CIDR ranges.
+- `RequestHeaderNames`, with an exact header-name `selector`,
+  `selectorMatchOperator: Equals`, and separate value matching.
+- Multiple scopes within one exception, including entire rulesets, rule groups,
+  and specific rule IDs in DRS, Bot Manager, and HTTP DDoS.
+
+The next-generation engine is required: the selected policy must configure
+DRS 2.1 or 2.2, including when an exception targets Bot Manager or HTTP DDoS.
+Only the embedded families/versions listed above are supported; this does not
+add Application Gateway or CRS migration.
+
+The dedicated **Request exceptions (Preview)** report section shows scope,
+match variable, header name where applicable, operator, match-value count,
+and `Present`/`---`. **Match values are not printed or included in report-only
+decision metadata**, because header values can contain credentials. Review
+the input JSON or Azure policy to inspect the actual values.
+
+`KeepSource` adds a source-only exception or removes a target-only exception.
+`KeepTarget` retains the destination's membership. No exception is split into
+independent scope choices, broadened, or transferred to a replacement rule.
+Source scope versions follow the destination versions without changing the
+destination's versions or rule identities. An unavailable rule/group makes
+KeepSource unavailable, with a warning beside the exception row.
+If an exception needs a family introduced by another choice, final validation
+requires that family to actually be present before writing the template.
+
+Without a master, exceptions for supported managed families start absent and
+are offered as source review choices, like other managed tuning. The selected
+entries are applied after rule/group choices and validated together.
+
+Local validation enforces 60 exceptions per policy, up to 600 IP match values
+or 10 URI/header match values per exception, valid predicates, and configured
+catalog scopes. The aggregate limit of 60 across policies associated with one
+Front Door cannot be checked from these policy inputs alone; verify associations,
+preview availability, and service acceptance using Azure deployment validation
+and what-if before deployment.
 
 ### Choosing settings
 
 Run with `-ReportOnly` first. It shows numbered comparisons and warnings without
 prompts, changes to the destination configuration, or output files.
+Compatibility and unresolved custom-priority warnings appear immediately below
+their comparison rows, including wrapped tables and narrow-console list layouts.
 
 | Choice | Effect on the selected row |
 |---|---|
@@ -134,9 +193,29 @@ Or pass row numbers/ranges through `-KeepSource` and `-KeepTarget`.
 Unlisted rows prompt during generation. Report-only presets only preview choices.
 The same row cannot be selected by both parameters.
 
-In the report, `---` means absence, `*` marks a setting that differs from its
+In the report, `---` means an absent or unspecified value, `*` marks a setting that differs from its
 documented defaults, and green highlights identify selected rows and values.
-Exclusions use `Present`/`---`, without default markers.
+Exclusions and request exceptions use `Present`/`---`, without default markers.
+
+Tags are labeled `Tag: <exact tag key>`. Their cells use `Existing value` when
+present and `---` when absent; tag contents are not printed. Target-only tags
+retain the master's values without requiring a choice.
+
+Bot/HTTP rule names come from each version's native catalog. A rule labeled
+`absent from target v1.0` exists in the source version but not in target version
+1.0; it does **not** mean the embedded catalog is missing its definition.
+For example, moving Bot Manager 1.1 to 1.0 removes `Bot100300` and
+`Bot200300` through `Bot200700`. Their target cells show `---`, and KeepSource
+cannot copy them into 1.0. Select a 1.1 master if you need to retain those rules;
+the script never changes the master's version automatically.
+`Bot200200` also changes meaning: 1.1 uses **Verified misc bots / Allow**, while
+1.0 uses **Unverified search engine crawlers / Log**. Both descriptions and their
+versions are shown when definitions differ; copying an action does not copy
+the source version's bot classification.
+
+For Bot/HTTP, a rule-set action of `---` means that field is omitted,
+not that inspection is disabled. Read the individual rule rows for their
+effective actions.
 
 **Use fresh row numbers after changing either input.** Choices apply to their own
 scope, not the whole policy. Once resolved, the script validates the result and
@@ -151,16 +230,26 @@ are separate steps.
 ### Requirements and syntax
 
 - PowerShell **7** and **Az.Accounts**.
-- An authenticated context matching the source subscription, with read permission
-  on the source policy. Application Gateway WAF is not supported.
+- The migration script is **self-contained**. No companion format, catalog,
+  helper, or configuration files are required. Local JSON inputs are needed only
+  when you explicitly supply them instead of resource IDs.
+- Summary labels use native PowerShell formatting and the current session theme;
+  the script does not register format files or change global label colors.
+- For resource-ID inputs, an authenticated Az context with read permission on each
+  live policy. Every live ID must match the selected subscription; the script does
+  not switch subscriptions. Use a JSON export to compare policies from different
+  subscriptions.
+- File-only runs require no Azure sign-in or context. Az.Accounts must still be
+  installed because the script declares it as a dependency.
+- Application Gateway WAF is not supported.
 - An existing output directory. Target names start with a letter and contain
   only letters/digits, up to 128 characters.
 
 ```powershell
 .\New-WafMigrationTemplate.ps1 `
-    -SourcePolicyResourceId <string> `
+    -SourcePolicy <resource-id-or-json-path> `
     -TargetPolicyName <string> `
-    [-MasterPolicyPath <string>] `
+    [-MasterPolicy <resource-id-or-json-path>] `
     [-ReportOnly] `
     [-KeepSource <string[]>] `
     [-KeepTarget <string[]>] `
@@ -171,47 +260,74 @@ are separate steps.
 
 | Parameter | Purpose |
 |---|---|
-| `SourcePolicyResourceId` | Required full source-policy resource ID |
+| `SourcePolicy` | Required source resource ID or JSON file path; alias for `SourcePolicyResourceId`. `SourcePolicyPath` is also accepted. |
 | `TargetPolicyName` | Required new Premium policy name |
-| `MasterPolicyPath` | Optional destination baseline file |
+| `MasterPolicy` | Optional master resource ID or JSON file path; alias for `MasterPolicyPath`. `MasterPolicyResourceId` is also accepted. |
 | `ReportOnly` | Compare without prompts or output |
 | `KeepSource`, `KeepTarget` | Report IDs/ranges, such as `1,2,'4-19'` |
 | `OutputPath` | Defaults to `<TargetPolicyName>.arm.json` in the current directory |
 | `Force` | Allow replacing an output file, never an input |
-| `DefaultProfile` | Optional explicit Az context |
+| `DefaultProfile` | Optional explicit Az context for live reads; ignored in file-only runs |
 
 `UseRecommendedTarget` is obsolete; use KeepSource/KeepTarget instead.
 
-### 1. Sign in and identify the source
+### 1. Choose source and master inputs
 
+Sign in only when at least one input is a resource ID:
 ```powershell
 Connect-AzAccount
 Set-AzContext -SubscriptionId '<subscription-id>'
 
 $sourceId = '/subscriptions/<subscription-id>/resourceGroups/<source-rg>/providers/Microsoft.Network/frontdoorWebApplicationFirewallPolicies/<source-policy>'
+$masterId = '/subscriptions/<subscription-id>/resourceGroups/<master-rg>/providers/Microsoft.Network/frontdoorWebApplicationFirewallPolicies/<master-policy>'
 ```
 
-The script uses the selected context; it does not switch subscriptions.
+The script uses the selected context; it does not switch subscriptions. Resource
+IDs are fetched with GET requests on every run. A path always uses the file's
+contents, even if the JSON includes a resource ID.
 
 ### 2. Preview without or with a master
 
 ```powershell
 # Latest included defaults for source-configured managed families.
 .\New-WafMigrationTemplate.ps1 `
-    -SourcePolicyResourceId $sourceId `
+    -SourcePolicy $sourceId `
     -TargetPolicyName newPolicy `
     -ReportOnly
 
 # Versions and settings from a master.
 .\New-WafMigrationTemplate.ps1 `
-    -SourcePolicyResourceId $sourceId `
+    -SourcePolicy $sourceId `
     -TargetPolicyName newPolicy `
-    -MasterPolicyPath .\Templates\mastertemplate.json `
+    -MasterPolicy .\Templates\mastertemplate.json `
+    -ReportOnly
+
+# Both policies read live from Azure.
+.\New-WafMigrationTemplate.ps1 `
+    -SourcePolicy $sourceId `
+    -MasterPolicy $masterId `
+    -TargetPolicyName newPolicy `
+    -ReportOnly
+
+# Entirely offline, using JSON exports or literal ARM templates.
+.\New-WafMigrationTemplate.ps1 `
+    -SourcePolicy .\source-policy.json `
+    -MasterPolicy .\Templates\mastertemplate.json `
+    -TargetPolicyName newPolicy `
+    -ReportOnly
+
+# A file source with a live master is also supported.
+.\New-WafMigrationTemplate.ps1 `
+    -SourcePolicy .\source-policy.json `
+    -MasterPolicy $masterId `
+    -TargetPolicyName newPolicy `
     -ReportOnly
 ```
 
 For a 2.1 destination, use a master declaring Microsoft_DefaultRuleSet 2.1.
 There is no separate target-version parameter.
+Existing commands using `-SourcePolicyResourceId` and `-MasterPolicyPath` continue
+to work, and both parameters now accept either kind of input.
 
 ### 3. Choose and generate
 
@@ -219,9 +335,9 @@ Omit `-ReportOnly` to choose interactively and generate the template:
 
 ```powershell
 $result = .\New-WafMigrationTemplate.ps1 `
-    -SourcePolicyResourceId $sourceId `
+    -SourcePolicy $sourceId `
     -TargetPolicyName newPolicy `
-    -MasterPolicyPath .\Templates\mastertemplate.json `
+    -MasterPolicy .\Templates\mastertemplate.json `
     -OutputPath .\newPolicy.arm.json
 ```
 
@@ -229,9 +345,9 @@ To preselect choices, use IDs from your current report. These numbers are exampl
 
 ```powershell
 $migration = @{
-    SourcePolicyResourceId = $sourceId
+    SourcePolicy           = $sourceId
     TargetPolicyName       = 'newPolicy'
-    MasterPolicyPath       = '.\Templates\mastertemplate.json'
+    MasterPolicy           = '.\Templates\mastertemplate.json'
     KeepSource             = @('1', '2', '4-19', '23')
     KeepTarget             = @('3', '20-22')
 }
@@ -240,14 +356,14 @@ $migration = @{
 $result = .\New-WafMigrationTemplate.ps1 @migration -OutputPath .\newPolicy.arm.json
 ```
 
-Unlisted rows and priority conflicts still prompt. Omit `MasterPolicyPath` to
+Unlisted rows and priority conflicts still prompt. Omit `MasterPolicy` to
 generate without a master. Use `-Force` to replace an existing output file.
 
 ### 4. Inspect results and export the catalog
 
 ```powershell
 $report = .\New-WafMigrationTemplate.ps1 `
-    -SourcePolicyResourceId $sourceId -TargetPolicyName newPolicy -ReportOnly
+    -SourcePolicy $sourceId -TargetPolicyName newPolicy -ReportOnly
 
 $report.Decisions |
     Select-Object Id, Scope, RuleSetType, RuleId, Choice, CompatibilityIssues
@@ -278,3 +394,48 @@ New-AzResourceGroupDeployment @deployment -Name 'wafMigration'
 ```
 
 Then configure Front Door associations and verify traffic, logs, and rollback.
+
+### Troubleshooting deployment module loading
+
+Older script versions deleted a temporary `waf-summary-*.format.ps1xml` file
+after registering it. PowerShell rereads registered format files when importing
+modules, which could prevent `Az.Resources` from loading in that same session.
+This is a local formatting error, not an Azure deployment or template error.
+
+The updated script uses native object display metadata and **does not need or
+register any format file**, including the former `WafMigration.format.ps1xml`.
+**Open a new PowerShell terminal** if the current session ran an older version
+that registered a format file: those paths remain cached in that old session.
+The generated ARM JSON is unaffected and does not need regeneration for this fix.
+Then import the deployment module and supply a real destination resource group:
+
+```powershell
+Import-Module Az.Resources -ErrorAction Stop
+New-AzResourceGroupDeployment `
+    -ResourceGroupName '<existing-destination-rg>' `
+    -TemplateFile '.\newPolicy.arm.json' `
+    -Mode Incremental -WhatIf -ErrorAction Stop
+```
+
+Do not leave `-ResourceGroupName` empty. What-if previews resource changes; omit
+`-WhatIf` only when you intend to deploy.
+
+### Regression checks
+
+```powershell
+pwsh -NoProfile -File .\Tests\Test-WafMigrationReport.ps1
+pwsh -NoProfile -File .\Tests\Test-WafMigrationInputs.ps1
+pwsh -NoProfile -File .\Tests\Test-WafMigrationFormatting.ps1
+pwsh -NoProfile -File .\Tests\Test-WafMigrationExceptions.ps1
+```
+
+These checks use local fixtures and mocked Azure GETs; they do not change Azure
+resources. They cover report labels and warning placement, both input formats,
+legacy parameter names, input/output protection, and live-context validation.
+The formatting check additionally requires Az.Resources and verifies that it
+loads after template generation and format-data refreshes in the same session.
+It also copies only the migration script into an isolated directory, generates
+an ARM template without companion files, and verifies deployment-module reimport.
+The exception check covers all three request attributes and managed families,
+scopes, independent membership choices, privacy, version alignment, limits,
+and preservation in generated ARM JSON without Azure reads or deployments.

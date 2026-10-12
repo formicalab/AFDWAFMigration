@@ -26,8 +26,7 @@ The catalogs are stored in the script:
 
 Microsoft_DefaultRuleSet supports **source versions 1.0, 1.1, 2.1, and 2.2** and
 **destination versions 2.1 and 2.2**. The catalogs contain the rule membership
-and state/action defaults for all four versions; the snapshot was verified on
-2026-10-08.
+and state/action defaults for all four versions.
 
 Comparison and validation use these local catalogs. Azure is queried only for
 inputs supplied as resource IDs, not to download catalog definitions. Unsupported versions
@@ -80,11 +79,10 @@ Source files must include a nonempty policy name.
 If the master includes Microsoft_DefaultRuleSet, that version must be 2.1 or 2.2.
 `DefaultRuleSet` is accepted as an alias for `Microsoft_DefaultRuleSet`.
 
-[Templates/mastertemplate.json](Templates/mastertemplate.json) is a sanitized example. It retains the original
-managed versions and rule state/action overrides, but removes customer identifiers,
-custom rules, exclusions, exceptions, log-scrubbing selectors, and custom responses.
-Adapt it to your needs; it is not equivalent to the original policy.
-Other files in `Templates` and generated test data/reports are ignored by Git.
+[Templates/mastertemplate.json](Templates/mastertemplate.json) is a sanitized example
+containing managed versions and rule state/action overrides, without customer
+identifiers, custom rules, exclusions, exceptions, log-scrubbing selectors, or
+custom responses. Adapt it to your needs.
 
 ### Checks and comparisons
 
@@ -137,8 +135,8 @@ from either live policy IDs or JSON inputs. It supports:
 
 The next-generation engine is required: the selected policy must configure
 DRS 2.1 or 2.2, including when an exception targets Bot Manager or HTTP DDoS.
-Only the embedded families/versions listed above are supported; this does not
-add Application Gateway or CRS migration.
+Only the embedded families/versions listed above are supported.
+Application Gateway and CRS migration are not supported.
 
 The dedicated **Request exceptions (Preview)** report section shows scope,
 match variable, header name where applicable, operator, match-value count,
@@ -230,11 +228,9 @@ are separate steps.
 ### Requirements and syntax
 
 - PowerShell **7** and **Az.Accounts**.
-- The migration script is **self-contained**. No companion format, catalog,
-  helper, or configuration files are required. Local JSON inputs are needed only
+- The migration script is **self-contained**. No companion files are required.
+  Local JSON inputs are needed only
   when you explicitly supply them instead of resource IDs.
-- Summary labels use native PowerShell formatting and the current session theme;
-  the script does not register format files or change global label colors.
 - For resource-ID inputs, an authenticated Az context with read permission on each
   live policy. Every live ID must match the selected subscription; the script does
   not switch subscriptions. Use a JSON export to compare policies from different
@@ -268,8 +264,6 @@ are separate steps.
 | `OutputPath` | Defaults to `<TargetPolicyName>.arm.json` in the current directory |
 | `Force` | Allow replacing an output file, never an input |
 | `DefaultProfile` | Optional explicit Az context for live reads; ignored in file-only runs |
-
-`UseRecommendedTarget` is obsolete; use KeepSource/KeepTarget instead.
 
 ### 1. Choose source and master inputs
 
@@ -326,8 +320,6 @@ contents, even if the JSON includes a resource ID.
 
 For a 2.1 destination, use a master declaring Microsoft_DefaultRuleSet 2.1.
 There is no separate target-version parameter.
-Existing commands using `-SourcePolicyResourceId` and `-MasterPolicyPath` continue
-to work, and both parameters now accept either kind of input.
 
 ### 3. Choose and generate
 
@@ -394,48 +386,3 @@ New-AzResourceGroupDeployment @deployment -Name 'wafMigration'
 ```
 
 Then configure Front Door associations and verify traffic, logs, and rollback.
-
-### Troubleshooting deployment module loading
-
-Older script versions deleted a temporary `waf-summary-*.format.ps1xml` file
-after registering it. PowerShell rereads registered format files when importing
-modules, which could prevent `Az.Resources` from loading in that same session.
-This is a local formatting error, not an Azure deployment or template error.
-
-The updated script uses native object display metadata and **does not need or
-register any format file**, including the former `WafMigration.format.ps1xml`.
-**Open a new PowerShell terminal** if the current session ran an older version
-that registered a format file: those paths remain cached in that old session.
-The generated ARM JSON is unaffected and does not need regeneration for this fix.
-Then import the deployment module and supply a real destination resource group:
-
-```powershell
-Import-Module Az.Resources -ErrorAction Stop
-New-AzResourceGroupDeployment `
-    -ResourceGroupName '<existing-destination-rg>' `
-    -TemplateFile '.\newPolicy.arm.json' `
-    -Mode Incremental -WhatIf -ErrorAction Stop
-```
-
-Do not leave `-ResourceGroupName` empty. What-if previews resource changes; omit
-`-WhatIf` only when you intend to deploy.
-
-### Regression checks
-
-```powershell
-pwsh -NoProfile -File .\Tests\Test-WafMigrationReport.ps1
-pwsh -NoProfile -File .\Tests\Test-WafMigrationInputs.ps1
-pwsh -NoProfile -File .\Tests\Test-WafMigrationFormatting.ps1
-pwsh -NoProfile -File .\Tests\Test-WafMigrationExceptions.ps1
-```
-
-These checks use local fixtures and mocked Azure GETs; they do not change Azure
-resources. They cover report labels and warning placement, both input formats,
-legacy parameter names, input/output protection, and live-context validation.
-The formatting check additionally requires Az.Resources and verifies that it
-loads after template generation and format-data refreshes in the same session.
-It also copies only the migration script into an isolated directory, generates
-an ARM template without companion files, and verifies deployment-module reimport.
-The exception check covers all three request attributes and managed families,
-scopes, independent membership choices, privacy, version alignment, limits,
-and preservation in generated ARM JSON without Azure reads or deployments.

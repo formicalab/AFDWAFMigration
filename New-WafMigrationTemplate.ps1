@@ -3,83 +3,52 @@
 
 <#
 .SYNOPSIS
-Prepares a deployable Front Door WAF ARM template from a source and optional master.
+Creates an Azure Front Door Premium WAF ARM template from a source policy.
 .DESCRIPTION
-Compares original managed-rule defaults plus source overrides with the master's declared
-family versions and overrides. Without a master, starts each source-configured family
-from its latest pinned defaults while preserving other source configuration.
-Families absent from both source and master are skipped completely.
-Writes a resource-group ARM deployment template using the latest verified
-stable WAF API (2026-04-01). Deployment validation, what-if and deployment are
-separate user-run operations; this script never performs them.
-Managed-rule decisions compare original defaults, actual source tuning, target-version
-defaults, and effective target behavior. Default-driven activity losses are independent.
-Master-only custom rules always require confirmation. Risk-only reviews can require
-KeepTarget acceptance or template correction when a safe same-ID source copy is unavailable.
-Superseded rules still present in the target catalog and their replacements are
-reviewed independently; no rule is automatically retired or remapped.
-Both policies accept a resource ID for live Azure values or a local resource/ARM JSON file.
-Reads Azure through Az.Accounts only when an input is a resource ID.
-Does not deploy, modify associations, or change the Az context.
-DRS 1.0/1.1/2.1/2.2, Bot Manager 1.0/1.1 and HTTP DDoS 1.0 native catalogs are embedded; documentation pages are
-never accessed at runtime. Managed-rule validation uses these embedded catalogs.
-The script is self-contained: catalogs and display metadata are embedded.
-Summary output uses native PowerShell formatting without registering format files.
+Compares a source policy with an optional master policy, resolves policy settings,
+custom rules, managed rules, exclusions, and request exceptions, then writes a
+resource-group ARM template. Inputs can be Azure resource IDs or local policy/ARM
+JSON files. Azure is read only for resource-ID inputs. The script never deploys or
+modifies Azure resources.
+
+Embedded catalogs support DRS 1.0, 1.1, 2.1, and 2.2; Bot Manager 1.0 and 1.1;
+and HTTP DDoS 1.0. A master keeps its declared managed-rule versions. Without a
+master, source-configured families use the latest embedded versions.
 .PARAMETER SourcePolicyResourceId
-Source Front Door WAF resource ID or JSON file path. SourcePolicy and SourcePolicyPath
-are aliases. A file may contain a resource export or one literal WAF resource in an
-ARM template. Live IDs must match the selected Az subscription.
+Source Front Door WAF resource ID or JSON file. SourcePolicy and SourcePolicyPath
+are aliases.
 .PARAMETER MasterPolicyPath
-Optional master resource ID or JSON file path. MasterPolicy and MasterPolicyResourceId
-are aliases. Live values are read from Azure; files may contain a resource export
-or an ARM template with one literal WAF resource.
-Its declared family versions are preserved and supply the target defaults.
-When omitted, source-configured families use clean DRS 2.2, Bot Manager 1.1 and
-HTTP DDoS 1.0 defaults; absent families are skipped and other settings preserved.
-Use named TargetPolicyName
-when omitting this parameter.
+Optional master Front Door WAF resource ID or JSON file. MasterPolicy and
+MasterPolicyResourceId are aliases.
 .PARAMETER TargetPolicyName
 Name of the new Premium Front Door WAF policy.
 .PARAMETER ReportOnly
-Shows source/target comparison tables and safety warnings without prompting,
-applying choices, or writing an ARM file.
+Shows comparisons and selected choices without prompting or writing a file.
+.PARAMETER Auto
+Selects source for every decision except target-only custom rules, which are retained.
+Can be combined with ReportOnly, but not KeepSource or KeepTarget. Priority conflicts
+still prompt during generation.
 .PARAMETER OutputPath
-Output ARM file. Defaults to <TargetPolicyName>.arm.json in the current directory.
+Output ARM file. Defaults to <TargetPolicyName>.arm.json.
 .PARAMETER Force
-Allows replacement of an existing output file, but never an input file.
+Replaces an existing output file. Inputs and the script cannot be overwritten.
 .PARAMETER KeepSource
-Comma-separated row IDs and inclusive ascending ranges (for example 1,2,4-19,23).
-Selected scopes use the source candidate. Repeated IDs within this list are
-selected once. A source-absent target
-custom rule, optional policy setting, or Bot/HTTP family membership is omitted.
-A source-absent replacement or newly introduced Bot/HTTP rule is explicitly disabled,
-not inherited from target defaults. Omitted policy settings use service defaults.
+Decision IDs or ranges that select source, for example 1,2,4-19.
 .PARAMETER KeepTarget
-Comma-separated row IDs and inclusive ascending ranges whose scope retains the
-target value. A source-only item is therefore omitted. Repeated IDs within this
-list are selected once; any row selected by both parameters is rejected.
+Decision IDs or ranges that select target. Cannot overlap KeepSource.
 .PARAMETER UseRecommendedTarget
-Obsolete correction parameter. Nonempty selections fail explicitly; use the
-independent KeepSource/KeepTarget review IDs instead.
+Obsolete. Nonempty values are rejected.
 .PARAMETER DefaultProfile
-Optional explicit Az context for isolated batch execution. Defaults to the current
-context; every live input must match its subscription. Not used for file-only runs,
-which require no Azure sign-in.
+Optional Az context for resource-ID inputs.
 .OUTPUTS
-PSCustomObject with summary counts, Decisions, DrsRiskAnalysis, DrsRuleInventory,
-ManagedRuleRiskAnalysis, ManagedRuleInventory, and TargetManagedRuleSets,
-target adjustments, supersession notices/baseline issues, and privacy-safe custom-rule behavior
-assessments. ReportOnly omits candidate values.
+PSCustomObject containing the migration summary, decisions, managed-rule analysis,
+and output path.
 .EXAMPLE
-.\New-WafMigrationTemplate.ps1 $sourceId .\Templates\mastertemplate.json newPolicy -ReportOnly
+.\New-WafMigrationTemplate.ps1 -SourcePolicy .\source.json -MasterPolicy .\Templates\mastertemplate.json -TargetPolicyName newPolicy -ReportOnly
 .EXAMPLE
-.\New-WafMigrationTemplate.ps1 -SourcePolicyResourceId $sourceId -TargetPolicyName newPolicy -ReportOnly
+.\New-WafMigrationTemplate.ps1 -SourcePolicy .\source.json -MasterPolicy .\Templates\mastertemplate.json -TargetPolicyName newPolicy -Auto -OutputPath .\newPolicy.arm.json
 .EXAMPLE
-.\New-WafMigrationTemplate.ps1 $sourceId .\Templates\mastertemplate.json newPolicy
-.EXAMPLE
-.\New-WafMigrationTemplate.ps1 $sourceId .\Templates\mastertemplate.json newPolicy -ReportOnly -KeepSource 1,2,'4-19',23 -KeepTarget 3,'20-22'
-.EXAMPLE
-.\New-WafMigrationTemplate.ps1 -SourcePolicy .\source.json -MasterPolicy $masterId -TargetPolicyName newPolicy -ReportOnly
+.\New-WafMigrationTemplate.ps1 -SourcePolicy $sourceId -TargetPolicyName newPolicy -KeepSource 1,2,'4-19' -KeepTarget 3
 #>
 [CmdletBinding()]
 param(
@@ -98,6 +67,7 @@ param(
     [string] $TargetPolicyName,
 
     [switch] $ReportOnly,
+    [switch] $Auto,
     [string] $OutputPath,
     [switch] $Force,
     [ValidateNotNullOrEmpty()]
@@ -185,6 +155,9 @@ function Resolve-DecisionRanges {
 #region Runtime configuration and writable API shapes
 $keepSourceRanges = ConvertTo-DecisionRanges $KeepSource 'KeepSource'
 $keepTargetRanges = ConvertTo-DecisionRanges $KeepTarget 'KeepTarget'
+if ($Auto -and ($KeepSource.Count -or $KeepTarget.Count)) {
+    throw '-Auto cannot be used with -KeepSource or -KeepTarget; automatic mode selects every decision.'
+}
 foreach ($sourceRange in $keepSourceRanges) {
     foreach ($targetRange in $keepTargetRanges) {
         if ($sourceRange.Start -le $targetRange.End -and $targetRange.Start -le $sourceRange.End) {
@@ -4827,6 +4800,10 @@ foreach ($decision in $decisions) {
     }
     if ($keepSourceIds.Contains($decision.Id)) { $decision.Choice = 'KeepSource' }
     elseif ($keepTargetIds.Contains($decision.Id)) { $decision.Choice = 'KeepTarget' }
+    # Automatic custom-rule union.
+    elseif ($Auto) {
+        $decision.Choice = if ($decision.DecisionKind -eq 'TargetCustomRule') { 'KeepTarget' } else { 'KeepSource' }
+    }
 }
 #endregion
 

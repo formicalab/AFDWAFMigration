@@ -1,9 +1,9 @@
 /Tests/*
-!/Tests/.gitkeep
 !/Tests/Test-WafMigrationReport.ps1
 !/Tests/Test-WafMigrationInputs.ps1
 !/Tests/Test-WafMigrationFormatting.ps1
 !/Tests/Test-WafMigrationExceptions.ps1
 /Templates/*
 !/Templates/mastertemplate.json
+!/Templates/masterfdwafpremium-drs22.json
 /Tools/*.xlsx

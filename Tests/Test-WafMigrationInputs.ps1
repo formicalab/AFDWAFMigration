@@ -189,6 +189,108 @@ try {
     Assert-Equal $output.resources[0].properties.managedRules.managedRuleSets[0].Contains('ruleSetAction') $false 'Absent scope action remains omitted, not an ARM marker'
     Assert-Equal ($outputText.Contains('---')) $false 'Report markers are not written as configuration values'
 
+    $autoSource = $sourceFixture | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
+    $autoMaster = $sourceFixture | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
+    $autoSource.name = 'AutoSource'
+    $autoMaster.name = 'AutoMaster'
+    $autoSource.tags.origin = 'source-auto'
+    $autoMaster.tags.origin = 'target-auto'
+    $autoMaster.properties.policySettings.mode = 'Detection'
+    $autoSource.properties.customRules = @{ rules = @(
+        @{
+            name = 'SharedRule'; enabledState = 'Enabled'; priority = 10
+            ruleType = 'MatchRule'; action = 'Block'
+            matchConditions = @(@{ matchVariable = 'RequestUri'; operator = 'Contains'; matchValue = @('/source-shared') })
+        },
+        @{
+            name = 'SourceOnlyRule'; enabledState = 'Enabled'; priority = 11
+            ruleType = 'MatchRule'; action = 'Log'
+            matchConditions = @(@{ matchVariable = 'RequestUri'; operator = 'Contains'; matchValue = @('/source-only') })
+        }
+    ) }
+    $autoMaster.properties.customRules = @{ rules = @(
+        @{
+            name = 'SharedRule'; enabledState = 'Enabled'; priority = 20
+            ruleType = 'MatchRule'; action = 'Log'
+            matchConditions = @(@{ matchVariable = 'RequestUri'; operator = 'Contains'; matchValue = @('/target-shared') })
+        },
+        @{
+            name = 'TargetOnlyRule'; enabledState = 'Enabled'; priority = 12
+            ruleType = 'MatchRule'; action = 'Block'
+            matchConditions = @(@{ matchVariable = 'RequestUri'; operator = 'Contains'; matchValue = @('/target-only') })
+        }
+    ) }
+    $sourceExclusion = @{ matchVariable = 'RequestCookieNames'; selectorMatchOperator = 'Equals'; selector = 'source-global' }
+    $sourceGroupExclusion = @{ matchVariable = 'RequestCookieNames'; selectorMatchOperator = 'Equals'; selector = 'source-group' }
+    $sourceRuleExclusion = @{ matchVariable = 'RequestCookieNames'; selectorMatchOperator = 'Equals'; selector = 'source-rule' }
+    $targetExclusion = @{ matchVariable = 'RequestCookieNames'; selectorMatchOperator = 'Equals'; selector = 'target-global' }
+    $targetGroupExclusion = @{ matchVariable = 'RequestCookieNames'; selectorMatchOperator = 'Equals'; selector = 'target-group' }
+    $targetRuleExclusion = @{ matchVariable = 'RequestCookieNames'; selectorMatchOperator = 'Equals'; selector = 'target-rule' }
+    $autoSource.properties.managedRules.managedRuleSets = @(
+        @{
+            ruleSetType = 'Microsoft_DefaultRuleSet'; ruleSetVersion = '2.2'; ruleSetAction = 'Block'
+            exclusions = @($sourceExclusion)
+            ruleGroupOverrides = @(@{
+                ruleGroupName = 'SQLI'; exclusions = @($sourceGroupExclusion)
+                rules = @(@{ ruleId = '942450'; enabledState = 'Enabled'; action = 'AnomalyScoring'; exclusions = @($sourceRuleExclusion) })
+            })
+        },
+        $autoSource.properties.managedRules.managedRuleSets[0]
+    )
+    $autoMaster.properties.managedRules.managedRuleSets = @(
+        @{
+            ruleSetType = 'Microsoft_DefaultRuleSet'; ruleSetVersion = '2.2'; ruleSetAction = 'Log'
+            exclusions = @($targetExclusion)
+            ruleGroupOverrides = @(@{
+                ruleGroupName = 'SQLI'; exclusions = @($targetGroupExclusion)
+                rules = @(@{ ruleId = '942450'; enabledState = 'Disabled'; action = 'Log'; exclusions = @($targetRuleExclusion) })
+            })
+        },
+        $autoMaster.properties.managedRules.managedRuleSets[0]
+    )
+    $autoSourceFile = Write-InputFixture 'auto-source.json' $autoSource
+    $autoMasterFile = Write-InputFixture 'auto-master.json' $autoMaster
+    $autoReport = & $migrationPath -SourcePolicy $autoSourceFile -MasterPolicy $autoMasterFile `
+        -TargetPolicyName AutoReportTest -Auto -ReportOnly 3>$null 6>$null
+    Assert-Equal $autoReport.OutputPath $null 'Automatic report-only mode writes no output'
+    Assert-Equal $autoReport.PendingDecisionCount 0 'Automatic mode resolves every displayed decision'
+    Assert-Equal @($autoReport.Decisions | Where-Object {
+        $_.DecisionKind -eq 'TargetCustomRule' -and $_.Choice -ne 'KeepTarget'
+    }).Count 0 'Automatic mode retains every target-only custom rule'
+    Assert-Equal @($autoReport.Decisions | Where-Object {
+        $_.DecisionKind -ne 'TargetCustomRule' -and $_.Choice -ne 'KeepSource'
+    }).Count 0 'Automatic mode selects source for every other decision'
+
+    $autoOutputFile = Join-Path $testDirectory 'auto-generated.arm.json'
+    $autoResult = & $migrationPath -SourcePolicy $autoSourceFile -MasterPolicy $autoMasterFile `
+        -TargetPolicyName AutoGeneratedTest -Auto -OutputPath $autoOutputFile 3>$null 6>$null
+    Assert-Equal $autoResult.PendingDecisionCount 0 'Automatic generation leaves no pending decisions'
+    $autoOutput = Get-Content -LiteralPath $autoOutputFile -Raw | ConvertFrom-Json -AsHashtable -Depth 100
+    $autoResource = $autoOutput.resources[0]
+    Assert-Equal $autoResource.tags.origin 'source-auto' 'Automatic mode selects source general settings'
+    Assert-Equal $autoResource.properties.policySettings.mode 'Prevention' 'Automatic mode selects source policy settings'
+    $generatedCustomRules = @{}
+    foreach ($rule in $autoResource.properties.customRules.rules) { $generatedCustomRules[$rule.name] = $rule }
+    Assert-Equal $generatedCustomRules.Count 3 'Automatic mode emits the custom-rule union by name'
+    Assert-Equal $generatedCustomRules.SharedRule.action 'Block' 'Automatic mode selects source for a shared custom rule'
+    Assert-Equal $generatedCustomRules.SharedRule.priority 10 'Shared custom rule keeps the source priority'
+    Assert-Equal $generatedCustomRules.SourceOnlyRule.action 'Log' 'Automatic mode retains a source-only custom rule'
+    Assert-Equal $generatedCustomRules.TargetOnlyRule.action 'Block' 'Automatic mode retains a target-only custom rule'
+    $generatedDrs = @($autoResource.properties.managedRules.managedRuleSets |
+        Where-Object ruleSetType -EQ 'Microsoft_DefaultRuleSet')[0]
+    Assert-Equal $generatedDrs.ruleSetAction 'Block' 'Automatic mode selects the source DRS global action'
+    Assert-Equal $generatedDrs.exclusions[0].selector 'source-global' 'Automatic mode selects source global exclusions'
+    Assert-Equal $generatedDrs.ruleGroupOverrides[0].exclusions[0].selector 'source-group' 'Automatic mode selects source group exclusions'
+    Assert-Equal $generatedDrs.ruleGroupOverrides[0].rules[0].exclusions[0].selector 'source-rule' 'Automatic mode selects source rule exclusions'
+
+    foreach ($manualParameter in 'KeepSource', 'KeepTarget') {
+        Assert-InputFailure (@{
+            SourcePolicy = $autoSourceFile; MasterPolicy = $autoMasterFile
+            TargetPolicyName = 'AutoConflictTest'; Auto = $true; $manualParameter = @('1')
+        }) '*-Auto cannot be used with -KeepSource or -KeepTarget*'
+    }
+    Write-Host 'PASS: automatic report, generation, custom-rule union, source exclusions and manual-selection rejection'
+
     foreach ($protectedFile in $sourceFile, $masterFile, $migrationPath) {
         Assert-InputFailure @{
             SourcePolicy = $sourceFile; MasterPolicy = $masterFile

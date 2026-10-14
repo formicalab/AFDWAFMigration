@@ -19,7 +19,7 @@ foreach ($definition in $ast.FindAll({
 }, $true)) {
     Invoke-Expression $definition.Extent.Text
 }
-foreach ($name in 'apiVersion', 'resourceType', 'drsPath', 'supersededRuleIds', 'retiredRuleIds',
+foreach ($name in 'apiVersion', 'resourceType', 'drsPath', 'supersededRuleIds',
     'actionType', 'stateType', 'wafShapes') {
     $assignment = $ast.Find({
         param($node)

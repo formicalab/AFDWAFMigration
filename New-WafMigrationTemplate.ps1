@@ -11,21 +11,20 @@ resource-group ARM template. Inputs can be Azure resource IDs or local policy/AR
 JSON files. Azure is read only for resource-ID inputs. The script never deploys or
 modifies Azure resources.
 
-Embedded catalogs support DRS 1.0, 1.1, 2.1, and 2.2; Bot Manager 1.0 and 1.1;
+Embedded catalogs support DRS 1.0, 1.1, 2.0, 2.1, and 2.2; Bot Manager 1.0 and 1.1;
 and HTTP DDoS 1.0. A master keeps its declared managed-rule versions. Without a
 master, source-configured families use the latest embedded versions.
-.PARAMETER SourcePolicyResourceId
-Source Front Door WAF resource ID or JSON file. SourcePolicy and SourcePolicyPath
-are aliases.
-.PARAMETER MasterPolicyPath
-Optional master Front Door WAF resource ID or JSON file. MasterPolicy and
-MasterPolicyResourceId are aliases.
+.PARAMETER SourcePolicy
+Source Front Door WAF resource ID or JSON file.
+.PARAMETER MasterPolicy
+Optional master Front Door WAF resource ID or JSON file.
 .PARAMETER TargetPolicyName
 Name of the new Premium Front Door WAF policy.
 .PARAMETER ReportOnly
 Shows comparisons and selected choices without prompting or writing a file.
 .PARAMETER Auto
-Selects source for every decision except target-only custom rules, which are retained.
+Selects compatible source decisions, retaining target when managed source carryover
+is unsupported. Target-only custom rules are retained.
 Can be combined with ReportOnly, but not KeepSource or KeepTarget. Priority conflicts
 still prompt during generation.
 .PARAMETER OutputPath
@@ -36,8 +35,6 @@ Replaces an existing output file. Inputs and the script cannot be overwritten.
 Decision IDs or ranges that select source, for example 1,2,4-19.
 .PARAMETER KeepTarget
 Decision IDs or ranges that select target. Cannot overlap KeepSource.
-.PARAMETER UseRecommendedTarget
-Obsolete. Nonempty values are rejected.
 .PARAMETER DefaultProfile
 Optional Az context for resource-ID inputs.
 .OUTPUTS
@@ -53,14 +50,12 @@ and output path.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [Alias('SourcePolicy', 'SourcePolicyPath')]
     [ValidateNotNullOrEmpty()]
-    [string] $SourcePolicyResourceId,
+    [string] $SourcePolicy,
 
     [Parameter(Position = 1)]
-    [Alias('MasterPolicy', 'MasterPolicyResourceId')]
     [ValidateNotNullOrEmpty()]
-    [string] $MasterPolicyPath,
+    [string] $MasterPolicy,
 
     [Parameter(Mandatory, Position = 2)]
     [ValidatePattern('^[A-Za-z][A-Za-z0-9]{0,127}$')]
@@ -74,15 +69,13 @@ param(
     [string[]] $KeepSource = @(),
     [ValidateNotNullOrEmpty()]
     [string[]] $KeepTarget = @(),
-    [ValidateNotNullOrEmpty()]
-    [ValidateRange(1, 2147483647)]
-    [int[]] $UseRecommendedTarget = @(),
     [Microsoft.Azure.Commands.Profile.Models.Core.PSAzureContext] $DefaultProfile
 )
 
 #region Decision selection parsing
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Write-Host 'Preparing WAF migration. Azure resources will not be changed.' -ForegroundColor Cyan
 
 function ConvertTo-DecisionRanges {
     <#
@@ -102,6 +95,7 @@ function ConvertTo-DecisionRanges {
     return ,@(
         foreach ($selection in $Selections) {
             foreach ($part in $selection.Split(',')) {
+                # Validate bounded endpoints before materializing any selected row IDs.
                 if ($part -notmatch '^\s*([0-9]+)(?:\s*-\s*([0-9]+))?\s*$') {
                     throw "Invalid -$ParameterName selection '$part'; use a positive row ID or ascending range such as 4-19."
                 }
@@ -166,7 +160,6 @@ foreach ($sourceRange in $keepSourceRanges) {
         }
     }
 }
-if ($UseRecommendedTarget.Count) { throw '-UseRecommendedTarget is obsolete. Use the current independent -KeepSource/-KeepTarget review IDs instead.' }
 # Latest stable version advertised by Microsoft.Network, verified 2026-10-05.
 $apiVersion = '2026-04-01'
 $resourceType = 'Microsoft.Network/FrontDoorWebApplicationFirewallPolicies'
@@ -177,11 +170,6 @@ $supersededRuleIds = @{
     '942110' = '99031001'; '942440' = '99031002'; '942150' = '99031003'
     '942260' = '99031004'; '942430' = '99031005'; '942340' = '99031006'
     '941120' = '99032001'; '931130' = '99032002'
-}
-# Historical DRS 2.1 "Replaced by" annotations, retained as inventory metadata only.
-$retiredRuleIds = @{
-    '942110' = '99031001'; '942150' = '99031003'
-    '942260' = '99031004'; '942440' = '99031002'
 }
 $actionType = 'string:Allow,Block,Log,Redirect,AnomalyScoring,JSChallenge,CAPTCHA'
 $stateType = 'string:Enabled,Disabled'
@@ -373,8 +361,9 @@ function Get-CanonicalValue {
     .SYNOPSIS
     Produces a deterministic JSON value for comparison.
     .DESCRIPTION
-    Sorts object keys and unordered array contents without changing string case.
+    Sorts object keys and unordered array contents while preserving ordinary string case.
     Transform arrays retain their order because transform composition is order-dependent.
+    Exclusion comparisons ignore header/cookie selector case without modifying input.
     .PARAMETER Value
     JSON value to canonicalize without mutating it.
     .PARAMETER Property
@@ -386,13 +375,18 @@ function Get-CanonicalValue {
     if ($Value -is [System.Collections.IDictionary]) {
         $result = [ordered]@{}
         foreach ($key in @($Value.Keys | Sort-Object -CaseSensitive)) {
-            $result[$key] = Get-CanonicalValue $Value[$key] $key
+            if ($Property -ceq 'exclusion' -and $key -ceq 'selector' -and
+                $Value['matchVariable'] -cin 'RequestHeaderNames', 'RequestCookieNames') {
+                $result[$key] = $Value[$key].ToUpperInvariant()
+            } else { $result[$key] = Get-CanonicalValue $Value[$key] $key }
         }
         return $result
     }
     if ($Value -is [System.Collections.IList]) {
         $items = @(
-            foreach ($item in $Value) { Get-CanonicalValue $item }
+            foreach ($item in $Value) {
+                Get-CanonicalValue $item $(if ($Property -ceq 'exclusions') { 'exclusion' } else { '' })
+            }
         )
         # Serialized sort keys compare nested objects consistently without reordering transform chains.
         if ($Property -ne 'transforms') {
@@ -410,7 +404,8 @@ function Test-JsonEqual {
     .SYNOPSIS
     Compares JSON values using migration-specific canonicalization.
     .DESCRIPTION
-    Ignores property and unordered-array ordering, but preserves wording, case, and transform order.
+    Ignores property and unordered-array ordering, preserving wording and transform order.
+    Case is preserved except header/cookie selectors in exclusion comparisons.
     .PARAMETER Left
     First JSON value.
     .PARAMETER Right
@@ -473,6 +468,7 @@ function Get-CustomRuleBehaviorAssessments {
         $conditionIndex = 0
         $conditions = @(
             foreach ($condition in (Get-Collection $rule 'matchConditions')) {
+                # Expose behavior-relevant condition metadata without leaking private match values.
                 $conditionIndex++
                 if ($condition['matchVariable'] -ceq 'RemoteAddr') { $null = $flags.Add('OriginalClientIp') }
                 if ($condition['matchVariable'] -ceq 'SocketAddr') { $null = $flags.Add('SocketPeerIp') }
@@ -496,6 +492,7 @@ function Get-CustomRuleBehaviorAssessments {
                 }
             }
         )
+        # Keep policy-level behavior flags separate from each condition's diagnostics.
         [pscustomobject]@{
             Name = $rule['name']
             EnabledState = $rule['enabledState'] ?? 'Enabled'
@@ -631,7 +628,7 @@ function Get-DrsRuleInventory {
         $supersedes[$replacementId] = $ruleId
     }
     return ,@(
-        foreach ($version in '1.0', '1.1', '2.1', '2.2') {
+        foreach ($version in '1.0', '1.1', '2.0', '2.1', '2.2') {
             $index = Get-CatalogIndex "Microsoft_DefaultRuleSet/$version"
             foreach ($groupName in @($index.Rules.Keys | Sort-Object -CaseSensitive)) {
                 foreach ($ruleId in @($index.Rules[$groupName].Keys | Sort-Object -CaseSensitive)) {
@@ -641,6 +638,7 @@ function Get-DrsRuleInventory {
                     }
                     $replacementId = if ($supersededRuleIds.ContainsKey($ruleId)) { $supersededRuleIds[$ruleId] } else { $null }
                     [pscustomobject]@{
+                        # Native defaults and replacement annotations are independent metadata.
                         RuleSetVersion = $version
                         RuleGroupName = $groupName
                         RuleId = $ruleId
@@ -657,8 +655,7 @@ function Get-DrsRuleInventory {
                         AvailableInDrs22 = $targetRules.ContainsKey($ruleId)
                         SupersededByRuleId = $replacementId
                         SupersededByRuleGroupName = if ($null -ne $replacementId) { $targetRules[$replacementId]['ruleGroupName'] } else { $null }
-                        SupersedesRuleId = if ($version -in '2.1', '2.2' -and $supersedes.ContainsKey($ruleId)) { $supersedes[$ruleId] } else { $null }
-                        RequiresReplacementInDrs22 = $retiredRuleIds.ContainsKey($ruleId)
+                        SupersedesRuleId = if ($version -in '2.0', '2.1', '2.2' -and $supersedes.ContainsKey($ruleId)) { $supersedes[$ruleId] } else { $null }
                     }
                 }
             }
@@ -724,6 +721,7 @@ function ConvertTo-PolicyConfiguration {
     if (-not $properties.Contains('customRules')) { $properties['customRules'] = [ordered]@{ rules = @() } }
     elseif (-not $properties['customRules'].Contains('rules')) { $properties['customRules']['rules'] = @() }
     foreach ($set in $sets) {
+        # Normalize omitted collections without altering configured rule values.
         if (-not $set.Contains('ruleGroupOverrides')) { $set['ruleGroupOverrides'] = @() }
         foreach ($group in $set['ruleGroupOverrides']) {
             if (-not $group.Contains('rules')) { $group['rules'] = @() }
@@ -781,6 +779,7 @@ function New-DefaultDrsTargetConfiguration {
     )
     if ($managed.Contains('exceptionsList')) {
         $exceptions = @(
+            # Discard defaulted-family scopes without widening any remaining exception.
             foreach ($exception in (Get-Collection $managed['exceptionsList'] 'exceptions')) {
                 $scopes = Get-Collection $exception 'scopes'
                 $otherScopes = @($scopes | Where-Object { $_['ruleSetType'] -cnotin $types })
@@ -995,6 +994,7 @@ function Get-CatalogIssues {
             $ruleOverrides = Get-Collection $group 'rules'
             $null = Get-IdentityMap $ruleOverrides 'ruleId' "$catalogKey/$groupName/rules"
             foreach ($rule in $ruleOverrides) {
+                # A shared ARM schema does not imply every managed family supports every field.
                 if ($additionalFamily -and (Get-Collection $rule 'exclusions').Count) {
                     "Exclusions are supported only for DRS, not $catalogKey/$groupName/$($rule['ruleId'])."
                 }
@@ -1034,6 +1034,7 @@ function Get-CatalogIssues {
                 $index = Get-CatalogIndex $key
                 $groups = $index.Groups
                 foreach ($group in (Get-Collection $scope 'ruleGroupScopes')) {
+                    # Reject unknown scope membership rather than widening an exception.
                     $name = [string] $group['ruleGroupName']
                     if (-not $groups.ContainsKey($name)) {
                         "Exception group $key/$name is not in the embedded catalog."
@@ -1070,6 +1071,7 @@ function Assert-TargetConfiguration {
         Assert-PolicyShape $Configuration['tags'][$tag] 'string' "Target.tags.$tag"
     }
     if ($Configuration['properties'].Contains('policySettings')) {
+        # Validate challenge timeouts against the service limits before writing a template.
         $settings = $Configuration['properties']['policySettings']
         foreach ($key in 'javascriptChallengeExpirationInMinutes', 'captchaExpirationInMinutes') {
             if ($settings.Contains($key) -and ($settings[$key] -lt 5 -or $settings[$key] -gt 1440)) {
@@ -1117,12 +1119,12 @@ function Assert-TargetConfiguration {
 function Get-EmbeddedDrsCatalog {
     <#
     .SYNOPSIS
-    Loads pinned DRS 1.0, 1.1, 2.1, and 2.2 membership, groups, and defaults.
+    Loads pinned DRS 1.0, 1.1, 2.0, 2.1, and 2.2 membership, groups, and defaults.
     .DESCRIPTION
-    Reviewed against Microsoft Learn on 2026-10-06. DRS 2.1 added on 2026-10-07.
-    Default states/actions and
-    native API identities were verified against the Azure 2026-04-01 catalog.
-    This data is local; neither documentation nor defaults are downloaded here.
+    Uses version-native rule identities, descriptions, defaults and paranoia levels
+    from the Azure 2026-04-01 managed-rule catalog. Microsoft Learn supplies the
+    companion display descriptions. This data is embedded; loading it makes no
+    network requests.
     #>
     # https://learn.microsoft.com/en-us/azure/web-application-firewall/afds/waf-front-door-drs
     $groupRows = @'
@@ -1151,6 +1153,23 @@ function Get-EmbeddedDrsCatalog {
 "1.1","RFI","Protect against remote file inclusion attacks"
 "1.1","SQLI","Protect against SQL-injection attacks"
 "1.1","XSS","Protect against cross-site scripting attacks"
+"2.0","FIX","Session Fixation attacks"
+"2.0","General","Method Enforcement"
+"2.0","JAVA","Java attacks"
+"2.0","LFI","Local file inclusion"
+"2.0","METHOD-ENFORCEMENT","Method Enforcement"
+"2.0","MS-ThreatIntel-AppSec","Path traversal evasion"
+"2.0","MS-ThreatIntel-CVEs","Rest API exploitation"
+"2.0","MS-ThreatIntel-SQLI","SQL injection"
+"2.0","MS-ThreatIntel-WebShells","Web shell attacks"
+"2.0","NODEJS","Node JS Attacks"
+"2.0","PHP","PHP attacks"
+"2.0","PROTOCOL-ATTACK","Protocol attack"
+"2.0","PROTOCOL-ENFORCEMENT","Protocol Enforcement"
+"2.0","RCE","Remote Command Execution attacks"
+"2.0","RFI","Remote file inclusion"
+"2.0","SQLI","SQL injection"
+"2.0","XSS","Cross-site scripting"
 "2.1","FIX","Session Fixation attacks"
 "2.1","General","Method Enforcement"
 "2.1","JAVA","Java attacks"
@@ -1434,6 +1453,176 @@ function Get-EmbeddedDrsCatalog {
 "1.1","XSS","941330","Enabled","Block","IE XSS Filters - Attack Detected",""
 "1.1","XSS","941340","Enabled","Block","IE XSS Filters - Attack Detected",""
 "1.1","XSS","941350","Enabled","Block","UTF-7 Encoding IE XSS - Attack Detected",""
+"2.0","FIX","943100","Enabled","AnomalyScoring","Possible Session Fixation Attack: Setting Cookie Values in HTML","1"
+"2.0","FIX","943110","Enabled","AnomalyScoring","Possible Session Fixation Attack: SessionID Parameter Name with Off-Domain Referer","1"
+"2.0","FIX","943120","Enabled","AnomalyScoring","Possible Session Fixation Attack: SessionID Parameter Name with No Referer","1"
+"2.0","General","200002","Enabled","AnomalyScoring","Failed to parse request body.","1"
+"2.0","General","200003","Enabled","AnomalyScoring","Multipart request body failed strict validation","1"
+"2.0","JAVA","944100","Enabled","AnomalyScoring","Remote Command Execution: Suspicious Java class detected","1"
+"2.0","JAVA","944110","Enabled","AnomalyScoring","Remote Command Execution: Java process spawn (CVE-2017-9805)","1"
+"2.0","JAVA","944120","Enabled","AnomalyScoring","Remote Command Execution: Java serialization (CVE-2015-5842)","1"
+"2.0","JAVA","944130","Enabled","AnomalyScoring","Suspicious Java class detected","1"
+"2.0","JAVA","944200","Enabled","AnomalyScoring","Magic bytes Detected, probable java serialization in use","2"
+"2.0","JAVA","944210","Enabled","AnomalyScoring","Magic bytes Detected Base64 Encoded, probable java serialization in use","2"
+"2.0","JAVA","944240","Enabled","AnomalyScoring","Remote Command Execution: Java serialization and Log4j vulnerability (CVE-2021-44228, CVE-2021-45046)","2"
+"2.0","JAVA","944250","Enabled","AnomalyScoring","Remote Command Execution: Suspicious Java method detected","2"
+"2.0","LFI","930100","Enabled","AnomalyScoring","Path Traversal Attack (/../)","1"
+"2.0","LFI","930110","Enabled","AnomalyScoring","Path Traversal Attack (/../)","1"
+"2.0","LFI","930120","Enabled","AnomalyScoring","OS File Access Attempt","1"
+"2.0","LFI","930130","Enabled","AnomalyScoring","Restricted File Access Attempt","1"
+"2.0","METHOD-ENFORCEMENT","911100","Enabled","AnomalyScoring","Method is not allowed by policy","1"
+"2.0","MS-ThreatIntel-AppSec","99030001","Enabled","AnomalyScoring","Path Traversal Evasion in Headers (/.././../)","2"
+"2.0","MS-ThreatIntel-AppSec","99030002","Enabled","AnomalyScoring","Path Traversal Evasion in Request Body (/.././../)","2"
+"2.0","MS-ThreatIntel-CVEs","99001001","Enabled","AnomalyScoring","Attempted F5 tmui (CVE-2020-5902) REST API Exploitation with known credentials","2"
+"2.0","MS-ThreatIntel-CVEs","99001014","Disabled","AnomalyScoring","Attempted Spring Cloud routing-expression injection (CVE-2022-22963)","2"
+"2.0","MS-ThreatIntel-CVEs","99001015","Disabled","AnomalyScoring","Attempted Spring Framework unsafe class object exploitation (CVE-2022-22965)","2"
+"2.0","MS-ThreatIntel-CVEs","99001016","Disabled","AnomalyScoring","Attempted Spring Cloud Gateway Actuator injection (CVE-2022-22947)","2"
+"2.0","MS-ThreatIntel-CVEs","99001017","Disabled","AnomalyScoring","Attempted Apache Struts file upload exploitation (CVE-2023-50164)","2"
+"2.0","MS-ThreatIntel-CVEs","99001018","Enabled","AnomalyScoring","Attempted React2Shell remote code execution exploitation (CVE-2025-55182)","1"
+"2.0","MS-ThreatIntel-SQLI","99031001","Enabled","AnomalyScoring","SQL Injection Attack: Common Injection Testing Detected","2"
+"2.0","MS-ThreatIntel-SQLI","99031002","Enabled","AnomalyScoring","SQL Comment Sequence Detected.","2"
+"2.0","MS-ThreatIntel-WebShells","99005002","Enabled","AnomalyScoring","Web Shell Interaction Attempt (POST)","2"
+"2.0","MS-ThreatIntel-WebShells","99005003","Enabled","AnomalyScoring","Web Shell Upload Attempt (POST) - CHOPPER PHP","2"
+"2.0","MS-ThreatIntel-WebShells","99005004","Enabled","AnomalyScoring","Web Shell Upload Attempt (POST) - CHOPPER ASPX","2"
+"2.0","MS-ThreatIntel-WebShells","99005006","Disabled","AnomalyScoring","Spring4Shell Interaction Attempt","2"
+"2.0","NODEJS","934100","Enabled","AnomalyScoring","Node.js Injection Attack","1"
+"2.0","PHP","933100","Enabled","AnomalyScoring","PHP Injection Attack: PHP Open Tag Found","1"
+"2.0","PHP","933110","Enabled","AnomalyScoring","PHP Injection Attack: PHP Script File Upload Found","1"
+"2.0","PHP","933120","Enabled","AnomalyScoring","PHP Injection Attack: Configuration Directive Found","1"
+"2.0","PHP","933130","Enabled","AnomalyScoring","PHP Injection Attack: Variables Found","1"
+"2.0","PHP","933140","Enabled","AnomalyScoring","PHP Injection Attack: I/O Stream Found","1"
+"2.0","PHP","933150","Enabled","AnomalyScoring","PHP Injection Attack: High-Risk PHP Function Name Found","1"
+"2.0","PHP","933151","Enabled","AnomalyScoring","PHP Injection Attack: Medium-Risk PHP Function Name Found","2"
+"2.0","PHP","933160","Enabled","AnomalyScoring","PHP Injection Attack: High-Risk PHP Function Call Found","1"
+"2.0","PHP","933170","Enabled","AnomalyScoring","PHP Injection Attack: Serialized Object Injection","1"
+"2.0","PHP","933180","Enabled","AnomalyScoring","PHP Injection Attack: Variable Function Call Found","1"
+"2.0","PHP","933200","Enabled","AnomalyScoring","PHP Injection Attack: Wrapper scheme detected","1"
+"2.0","PHP","933210","Enabled","AnomalyScoring","PHP Injection Attack: Variable Function Call Found","1"
+"2.0","PROTOCOL-ATTACK","921110","Enabled","AnomalyScoring","HTTP Request Smuggling Attack","1"
+"2.0","PROTOCOL-ATTACK","921120","Enabled","AnomalyScoring","HTTP Response Splitting Attack","1"
+"2.0","PROTOCOL-ATTACK","921130","Enabled","AnomalyScoring","HTTP Response Splitting Attack","1"
+"2.0","PROTOCOL-ATTACK","921140","Enabled","AnomalyScoring","HTTP Header Injection Attack via headers","1"
+"2.0","PROTOCOL-ATTACK","921150","Enabled","AnomalyScoring","HTTP Header Injection Attack via payload (CR/LF detected)","1"
+"2.0","PROTOCOL-ATTACK","921151","Enabled","AnomalyScoring","HTTP Header Injection Attack via payload (CR/LF detected)","2"
+"2.0","PROTOCOL-ATTACK","921160","Enabled","AnomalyScoring","HTTP Header Injection Attack via payload (CR/LF and header-name detected)","1"
+"2.0","PROTOCOL-ENFORCEMENT","920100","Enabled","AnomalyScoring","Invalid HTTP Request Line","1"
+"2.0","PROTOCOL-ENFORCEMENT","920120","Enabled","AnomalyScoring","Attempted multipart/form-data bypass","1"
+"2.0","PROTOCOL-ENFORCEMENT","920121","Enabled","AnomalyScoring","Attempted multipart/form-data bypass","2"
+"2.0","PROTOCOL-ENFORCEMENT","920160","Enabled","AnomalyScoring","Content-Length HTTP header is not numeric.","1"
+"2.0","PROTOCOL-ENFORCEMENT","920170","Enabled","AnomalyScoring","GET or HEAD Request with Body Content.","1"
+"2.0","PROTOCOL-ENFORCEMENT","920171","Enabled","AnomalyScoring","GET or HEAD Request with Transfer-Encoding.","1"
+"2.0","PROTOCOL-ENFORCEMENT","920180","Enabled","AnomalyScoring","POST without Content-Length or Transfer-Encoding headers.","1"
+"2.0","PROTOCOL-ENFORCEMENT","920190","Enabled","AnomalyScoring","Range: Invalid Last Byte Value.","1"
+"2.0","PROTOCOL-ENFORCEMENT","920200","Enabled","AnomalyScoring","Range: Too many fields (6 or more)","2"
+"2.0","PROTOCOL-ENFORCEMENT","920201","Enabled","AnomalyScoring","Range: Too many fields for pdf request (63 or more)","2"
+"2.0","PROTOCOL-ENFORCEMENT","920210","Enabled","AnomalyScoring","Multiple/Conflicting Connection Header Data Found.","1"
+"2.0","PROTOCOL-ENFORCEMENT","920220","Enabled","AnomalyScoring","URL Encoding Abuse Attack Attempt","1"
+"2.0","PROTOCOL-ENFORCEMENT","920230","Enabled","AnomalyScoring","Multiple URL Encoding Detected","2"
+"2.0","PROTOCOL-ENFORCEMENT","920240","Enabled","AnomalyScoring","URL Encoding Abuse Attack Attempt","1"
+"2.0","PROTOCOL-ENFORCEMENT","920260","Enabled","AnomalyScoring","Unicode Full/Half Width Abuse Attack Attempt","1"
+"2.0","PROTOCOL-ENFORCEMENT","920270","Enabled","AnomalyScoring","Invalid character in request (null character)","1"
+"2.0","PROTOCOL-ENFORCEMENT","920271","Enabled","AnomalyScoring","Invalid character in request (non printable characters)","2"
+"2.0","PROTOCOL-ENFORCEMENT","920280","Enabled","AnomalyScoring","Request Missing a Host Header","1"
+"2.0","PROTOCOL-ENFORCEMENT","920290","Enabled","AnomalyScoring","Empty Host Header","1"
+"2.0","PROTOCOL-ENFORCEMENT","920300","Enabled","AnomalyScoring","Request Missing an Accept Header","2"
+"2.0","PROTOCOL-ENFORCEMENT","920310","Enabled","AnomalyScoring","Request Has an Empty Accept Header","1"
+"2.0","PROTOCOL-ENFORCEMENT","920311","Enabled","AnomalyScoring","Request Has an Empty Accept Header","1"
+"2.0","PROTOCOL-ENFORCEMENT","920320","Enabled","AnomalyScoring","Missing User Agent Header","2"
+"2.0","PROTOCOL-ENFORCEMENT","920330","Enabled","AnomalyScoring","Empty User Agent Header","1"
+"2.0","PROTOCOL-ENFORCEMENT","920340","Enabled","AnomalyScoring","Request Containing Content, but Missing Content-Type header","1"
+"2.0","PROTOCOL-ENFORCEMENT","920341","Enabled","AnomalyScoring","Request Containing Content Requires Content-Type header","2"
+"2.0","PROTOCOL-ENFORCEMENT","920350","Enabled","AnomalyScoring","Host header is a numeric IP address","1"
+"2.0","PROTOCOL-ENFORCEMENT","920420","Enabled","AnomalyScoring","Request content type is not allowed by policy","1"
+"2.0","PROTOCOL-ENFORCEMENT","920430","Enabled","AnomalyScoring","HTTP protocol version is not allowed by policy","1"
+"2.0","PROTOCOL-ENFORCEMENT","920440","Enabled","AnomalyScoring","URL file extension is restricted by policy","1"
+"2.0","PROTOCOL-ENFORCEMENT","920450","Enabled","AnomalyScoring","HTTP header is restricted by policy","1"
+"2.0","PROTOCOL-ENFORCEMENT","920470","Enabled","AnomalyScoring","Illegal Content-Type header","1"
+"2.0","PROTOCOL-ENFORCEMENT","920480","Enabled","AnomalyScoring","Request content type charset is not allowed by policy","1"
+"2.0","RCE","932100","Enabled","AnomalyScoring","Remote Command Execution: Unix Command Injection","1"
+"2.0","RCE","932105","Enabled","AnomalyScoring","Remote Command Execution: Unix Command Injection","1"
+"2.0","RCE","932110","Enabled","AnomalyScoring","Remote Command Execution: Windows Command Injection","1"
+"2.0","RCE","932115","Enabled","AnomalyScoring","Remote Command Execution: Windows Command Injection","1"
+"2.0","RCE","932120","Enabled","AnomalyScoring","Remote Command Execution: Windows PowerShell Command Found","1"
+"2.0","RCE","932130","Enabled","AnomalyScoring","Remote Command Execution: Unix Shell Expression or Confluence Vulnerability (CVE-2022-26134) Found","1"
+"2.0","RCE","932140","Enabled","AnomalyScoring","Remote Command Execution: Windows FOR/IF Command Found","1"
+"2.0","RCE","932150","Enabled","AnomalyScoring","Remote Command Execution: Direct Unix Command Execution","1"
+"2.0","RCE","932160","Enabled","AnomalyScoring","Remote Command Execution: Unix Shell Code Found","1"
+"2.0","RCE","932170","Enabled","AnomalyScoring","Remote Command Execution: Shellshock (CVE-2014-6271)","1"
+"2.0","RCE","932171","Enabled","AnomalyScoring","Remote Command Execution: Shellshock (CVE-2014-6271)","1"
+"2.0","RCE","932180","Enabled","AnomalyScoring","Restricted File Upload Attempt","1"
+"2.0","RFI","931100","Enabled","AnomalyScoring","Possible Remote File Inclusion (RFI) Attack: URL Parameter using IP Address","1"
+"2.0","RFI","931110","Enabled","AnomalyScoring","Possible Remote File Inclusion (RFI) Attack: Common RFI Vulnerable Parameter Name used w/URL Payload","1"
+"2.0","RFI","931120","Enabled","AnomalyScoring","Possible Remote File Inclusion (RFI) Attack: URL Payload Used w/Trailing Question Mark Character (?)","1"
+"2.0","RFI","931130","Enabled","AnomalyScoring","Possible Remote File Inclusion (RFI) Attack: Off-Domain Reference/Link","2"
+"2.0","SQLI","942100","Enabled","AnomalyScoring","SQL Injection Attack Detected via libinjection","1"
+"2.0","SQLI","942110","Disabled","AnomalyScoring","SQL Injection Attack: Common Injection Testing Detected","2"
+"2.0","SQLI","942120","Enabled","AnomalyScoring","SQL Injection Attack: SQL Operator Detected","2"
+"2.0","SQLI","942140","Enabled","AnomalyScoring","SQL Injection Attack: Common DB Names Detected","1"
+"2.0","SQLI","942150","Enabled","AnomalyScoring","SQL Injection Attack (replaced by rule #99031003)","2"
+"2.0","SQLI","942160","Enabled","AnomalyScoring","Detects blind sqli tests using sleep() or benchmark().","1"
+"2.0","SQLI","942170","Enabled","AnomalyScoring","Detects SQL benchmark and sleep injection attempts including conditional queries","1"
+"2.0","SQLI","942180","Enabled","AnomalyScoring","Detects basic SQL authentication bypass attempts 1/3","2"
+"2.0","SQLI","942190","Enabled","AnomalyScoring","Detects MSSQL code execution and information gathering attempts","1"
+"2.0","SQLI","942200","Enabled","AnomalyScoring","Detects MySQL comment-/space-obfuscated injections and backtick termination","2"
+"2.0","SQLI","942210","Enabled","AnomalyScoring","Detects chained SQL injection attempts 1/2","2"
+"2.0","SQLI","942220","Enabled","AnomalyScoring","Looking for integer overflow attacks, these are taken from skipfish, except 3.0.00738585072007e-308 is the ""magic number"" crash","1"
+"2.0","SQLI","942230","Enabled","AnomalyScoring","Detects conditional SQL injection attempts","1"
+"2.0","SQLI","942240","Enabled","AnomalyScoring","Detects MySQL charset switch and MSSQL DoS attempts","1"
+"2.0","SQLI","942250","Enabled","AnomalyScoring","Detects MATCH AGAINST, MERGE and EXECUTE IMMEDIATE injections","1"
+"2.0","SQLI","942260","Enabled","AnomalyScoring","Detects basic SQL authentication bypass attempts 2/3 (replaced by rule #99031004)","2"
+"2.0","SQLI","942270","Enabled","AnomalyScoring","Looking for basic sql injection. Common attack string for mysql, oracle and others.","1"
+"2.0","SQLI","942280","Enabled","AnomalyScoring","Detects Postgres pg_sleep injection, waitfor delay attacks and database shutdown attempts","1"
+"2.0","SQLI","942290","Enabled","AnomalyScoring","Finds basic MongoDB SQL injection attempts","1"
+"2.0","SQLI","942300","Enabled","AnomalyScoring","Detects MySQL comments, conditions and ch(a)r injections","2"
+"2.0","SQLI","942310","Enabled","AnomalyScoring","Detects chained SQL injection attempts 2/2","2"
+"2.0","SQLI","942320","Enabled","AnomalyScoring","Detects MySQL and PostgreSQL stored procedure/function injections","1"
+"2.0","SQLI","942330","Enabled","AnomalyScoring","Detects classic SQL injection probings 1/3","2"
+"2.0","SQLI","942340","Enabled","AnomalyScoring","Detects basic SQL authentication bypass attempts 3/3 (replaced by rule #99031006)","2"
+"2.0","SQLI","942350","Enabled","AnomalyScoring","Detects MySQL UDF injection and other data/structure manipulation attempts","1"
+"2.0","SQLI","942360","Enabled","AnomalyScoring","Detects concatenated basic SQL injection and SQLLFI attempts","1"
+"2.0","SQLI","942361","Enabled","AnomalyScoring","Detects basic SQL injection based on keyword alter or union","2"
+"2.0","SQLI","942370","Enabled","AnomalyScoring","Detects classic SQL injection probings 2/3","2"
+"2.0","SQLI","942380","Enabled","AnomalyScoring","SQL Injection Attack","2"
+"2.0","SQLI","942390","Enabled","AnomalyScoring","SQL Injection Attack","2"
+"2.0","SQLI","942400","Enabled","AnomalyScoring","SQL Injection Attack","2"
+"2.0","SQLI","942410","Enabled","AnomalyScoring","SQL Injection Attack","2"
+"2.0","SQLI","942430","Disabled","AnomalyScoring","Restricted SQL Character Anomaly Detection (args): # of special characters exceeded (12) (replaced by rule #99031005)","2"
+"2.0","SQLI","942440","Disabled","AnomalyScoring","SQL Comment Sequence Detected (replaced by rule #99031002).","2"
+"2.0","SQLI","942450","Enabled","AnomalyScoring","SQL Hex Encoding Identified","2"
+"2.0","SQLI","942470","Enabled","AnomalyScoring","SQL Injection Attack","2"
+"2.0","SQLI","942480","Enabled","AnomalyScoring","SQL Injection Attack","2"
+"2.0","SQLI","942500","Enabled","AnomalyScoring","MySQL in-line comment detected.","1"
+"2.0","SQLI","942510","Enabled","AnomalyScoring","SQLi bypass attempt by ticks or backticks detected.","2"
+"2.0","XSS","941100","Enabled","AnomalyScoring","XSS Attack Detected via libinjection","1"
+"2.0","XSS","941101","Enabled","AnomalyScoring","XSS Attack Detected via libinjection","2"
+"2.0","XSS","941110","Enabled","AnomalyScoring","XSS Filter - Category 1: Script Tag Vector","1"
+"2.0","XSS","941120","Enabled","AnomalyScoring","XSS Filter - Category 2: Event Handler Vector","1"
+"2.0","XSS","941130","Enabled","AnomalyScoring","XSS Filter - Category 3: Attribute Vector","1"
+"2.0","XSS","941140","Enabled","AnomalyScoring","XSS Filter - Category 4: Javascript URI Vector","1"
+"2.0","XSS","941150","Enabled","AnomalyScoring","XSS Filter - Category 5: Disallowed HTML Attributes","2"
+"2.0","XSS","941160","Enabled","AnomalyScoring","NoScript XSS InjectionChecker: HTML Injection","1"
+"2.0","XSS","941170","Enabled","AnomalyScoring","NoScript XSS InjectionChecker: Attribute Injection","1"
+"2.0","XSS","941180","Enabled","AnomalyScoring","Node-Validator Blacklist Keywords","1"
+"2.0","XSS","941190","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941200","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941210","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941220","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941230","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941240","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941250","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941260","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941270","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941280","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941290","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941300","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","1"
+"2.0","XSS","941310","Enabled","AnomalyScoring","US-ASCII Malformed Encoding XSS Filter - Attack Detected.","1"
+"2.0","XSS","941320","Enabled","AnomalyScoring","Possible XSS Attack Detected - HTML Tag Handler","2"
+"2.0","XSS","941330","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","2"
+"2.0","XSS","941340","Enabled","AnomalyScoring","IE XSS Filters - Attack Detected.","2"
+"2.0","XSS","941350","Enabled","AnomalyScoring","UTF-7 Encoding IE XSS - Attack Detected.","1"
+"2.0","XSS","941360","Enabled","AnomalyScoring","JSFuck / Hieroglyphy obfuscation detected","1"
+"2.0","XSS","941370","Enabled","AnomalyScoring","JavaScript global variable found","1"
+"2.0","XSS","941380","Enabled","AnomalyScoring","AngularJS client side template injection detected","2"
 "2.1","FIX","943100","Enabled","AnomalyScoring","Possible Session Fixation Attack: Setting Cookie Values in HTML","1"
 "2.1","FIX","943110","Enabled","AnomalyScoring","Possible Session Fixation Attack: SessionID Parameter Name with Off-Domain Referer","1"
 "2.1","FIX","943120","Enabled","AnomalyScoring","Possible Session Fixation Attack: SessionID Parameter Name with No Referer","1"
@@ -1828,7 +2017,7 @@ function Get-EmbeddedDrsCatalog {
 "2.2","XSS","941380","Disabled","AnomalyScoring","AngularJS client side template injection detected","2"
 '@ | ConvertFrom-Csv
     $definitions = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    foreach ($version in '1.0', '1.1', '2.1', '2.2') {
+    foreach ($version in '1.0', '1.1', '2.0', '2.1', '2.2') {
         $groups = @(
             foreach ($group in ($groupRows | Where-Object RuleSetVersion -ceq $version)) {
                 @{
@@ -1838,6 +2027,7 @@ function Get-EmbeddedDrsCatalog {
                         foreach ($rule in ($ruleRows | Where-Object {
                             $_.RuleSetVersion -ceq $version -and $_.RuleGroupName -ceq $group.RuleGroupName
                         })) {
+                            # Each source version must carry its own verified defaults and PL metadata.
                             if ($rule.DefaultState -cnotin 'Enabled', 'Disabled' -or
                                 $rule.DefaultAction -cnotin 'Block', 'AnomalyScoring') {
                                 throw "Invalid embedded defaults for DRS $version/$($group.RuleGroupName)/$($rule.RuleId)."
@@ -1913,6 +2103,7 @@ Microsoft_HTTPDDoSRuleSet,1.0,ExcessiveRequests,500110,Log,Suspected bots sendin
         $groups = @(
             foreach ($group in ($version.Group | Group-Object Group)) {
                 @{
+                    # Bot/HTTP families have independent native actions and optional sensitivity.
                     ruleGroupName = $group.Name
                     description = switch ($group.Name) {
                         BadBots { 'Bad bots' }; GoodBots { 'Good bots' }
@@ -2011,6 +2202,7 @@ function New-DisabledManagedRuleSet {
     }
     $set = @{
         ruleSetType = $RuleSetType; ruleSetVersion = $Version
+        # Materialize every native rule as disabled when the family is absent from the target.
         ruleGroupOverrides = @(
             foreach ($groupName in ($index.Rules.Keys | Sort-Object -CaseSensitive)) {
                 @{
@@ -2040,6 +2232,7 @@ function Sync-ManagedSourceVersions {
     foreach ($type in (Get-ManagedRuleSetTypes)) {
         $left = Get-DrsSet $Configuration $type
         $right = Get-DrsSet $TargetConfiguration $type
+        # Align carryover scopes only for families actually configured in both policies.
         if ($null -eq $left -or $null -eq $right) { continue }
         $left['ruleSetVersion'] = $right['ruleSetVersion']
         $managed = $Configuration['properties']['managedRules']
@@ -2063,6 +2256,7 @@ function Get-ManagedCatalogInventory {
     foreach ($key in ($drsCatalog.Keys | Sort-Object -CaseSensitive)) {
         $parts = $key -split '/', 2
         foreach ($group in $drsCatalog[$key]['ruleGroups']) {
+            # Export version-native data rather than the separately maintained display snapshot.
             foreach ($rule in $group['rules']) {
                 [pscustomobject]@{
                     RuleSetType = $parts[0]; RuleSetVersion = $parts[1]
@@ -2083,7 +2277,7 @@ function Get-DrsDocumentation {
     Loads the embedded official Front Door DRS display metadata.
     .DESCRIPTION
     Parses the preconfigured group and rule tables once per script execution.
-    DRS 2.2 wording takes precedence; DRS 2.1-only entries support legacy review.
+    DRS 2.2 wording takes precedence; DRS 2.1-only entries provide native display coverage.
     No website is accessed, and display labels never replace API identities.
     .OUTPUTS
     Object with Groups and Rules dictionaries keyed by API group and group/rule ID.
@@ -2391,6 +2585,7 @@ function Get-DecisionDisplay {
             $description = "Not available in the embedded catalog: $catalogKey"
         }
         elseif ($groupName) {
+            # Display unresolved native scopes explicitly instead of borrowing a different rule.
             $index = Get-CatalogIndex $catalogKey
             $groups = $index.Groups
             if (-not $groups.ContainsKey($groupName)) {
@@ -2398,6 +2593,7 @@ function Get-DecisionDisplay {
             }
             else {
                 $definition = $groups[$groupName]
+                # Group descriptions are usable only until an individual rule is requested.
                 if ($ruleId) {
                     $rules = $index.Rules[$groupName]
                     $definition = if ($rules.ContainsKey($ruleId)) { $rules[$ruleId] } else { $null }
@@ -2414,6 +2610,7 @@ function Get-DecisionDisplay {
         # Use the official display snapshot, with native descriptions for a 2.1 target.
         if ($type -eq 'Microsoft_DefaultRuleSet' -and $groupName) {
             if ($ruleId) {
+                # Prefer native target metadata when the display snapshot describes a newer version.
                 $targetVersion = (Get-DrsTargetVersion) ?? (Get-LatestManagedRuleSetVersion $type)
                 $targetIndex = Get-CatalogIndex "Microsoft_DefaultRuleSet/$targetVersion"
                 if ($targetIndex.Rules.ContainsKey($groupName) -and $targetIndex.Rules[$groupName].ContainsKey($ruleId)) {
@@ -2515,6 +2712,7 @@ function Write-HighlightedReviewRow {
     foreach ($line in ($Text -split '\r?\n')) {
         $segments = [System.Collections.Generic.List[object]]::new()
         if ($ListLayout) {
+            # Track the active field so wrapped list values retain the correct highlight.
             $field = [regex]::Match($line, '^((' + $fieldNames + ')[ \t]*:[ \t]*)(.*)$')
             $start = 0
             if ($field.Success) {
@@ -2526,6 +2724,7 @@ function Write-HighlightedReviewRow {
                 if ($value.Success) { $segments.Add(@{ Start = $start + $value.Index; Length = $value.Length }) }
             }
         } else {
+            # Recover table cell offsets from visible widths, not ANSI-encoded output.
             $start = 0
             for ($index = 0; $index -lt $Properties.Count; $index++) {
                 if (($index -eq 0 -or $Properties[$index] -eq $SelectedProperty) -and $start -lt $line.Length) {
@@ -2611,6 +2810,7 @@ function Write-ResponsiveTable {
     # When even headers cannot fit, a list preserves all content instead of truncating columns.
     if ($Width -lt $minimumWidth) {
         if ($RowColorProperty -or $RowWarningProperty) {
+            # Narrow layouts still show row-specific choices and compatibility warnings.
             foreach ($row in $Rows) {
                 $text = ($row | Format-List -Property $Properties | Out-String -Width ([Math]::Max(20, $Width))).TrimEnd()
                 $selected = if ($SelectedColumnProperty) { [string] $row.$SelectedColumnProperty } else { '' }
@@ -2632,6 +2832,7 @@ function Write-ResponsiveTable {
     $preferredFlexibleWidth = 0
     $widths = @(
         for ($index = 0; $index -lt $Properties.Count; $index++) {
+            # Compact columns keep their content widths; the flexible column absorbs wrapping.
             $length = $minimum[$index]
             foreach ($row in $Rows) {
                 foreach ($line in ([string] $row.($Properties[$index]) -split '\r?\n')) {
@@ -2649,6 +2850,7 @@ function Write-ResponsiveTable {
     # Shrink the compact column with the most spare width, keeping every header readable.
     [int] $totalWidth = ($widths | Measure-Object -Sum).Sum + $separatorWidth
     while ($totalWidth -gt $Width) {
+        # Redistribute spare width without shrinking any column below its header.
         $shrinkIndex = -1
         $slack = 0
         for ($index = 0; $index -lt $Properties.Count; $index++) {
@@ -2677,6 +2879,7 @@ function Write-ResponsiveTable {
         }
     )
     if ($RowColorProperty -or $RowWarningProperty) {
+        # Render rows individually so selected cells and warnings stay associated with their ID.
         if (-not $HideTableHeaders) {
             $headerRow = [ordered]@{}
             foreach ($property in $Properties) { $headerRow[$property] = $null }
@@ -2823,6 +3026,7 @@ function Get-DecisionOverview {
     #>
     param($Item)
     if ($Item.DecisionKind -eq 'ManagedException') {
+        # Exception summaries show scope and value counts, never the sensitive predicates.
         $context = $Item.ExceptionContext
         return [pscustomobject]@{
             Id = $Item.Id; Item = 'Request exception'; Name = 'Request exception'
@@ -2834,6 +3038,7 @@ function Get-DecisionOverview {
         }
     }
     if ($Item.DecisionKind -eq 'DrsExclusion') {
+        # Exclusion membership is reviewed independently from rule state and action.
         $context = $Item.ExclusionContext
         $exclusion = $Item.SourceValue ?? $Item.TargetValue
         $scope = switch ($context.ScopeKind) {
@@ -2863,6 +3068,7 @@ function Get-DecisionOverview {
         $sourceText = 'Not used'; $targetText = 'Included'
     }
     elseif ($Item.DecisionKind -eq 'DrsRisk') {
+        # Represent native same-ID behavior changes without suggesting a cross-ID copy.
         $row = $Item.RiskContext[0]
         $group = switch ($Item.RuleGroupName) {
             '(rule-set scope)' { 'All managed rules' }
@@ -2881,18 +3087,6 @@ function Get-DecisionOverview {
         elseif ($row.ScopeKind -eq 'RuleSetAction') {
             $label = 'Managed-rule action'
             $sourceText = $row.SourceEffectiveAction; $targetText = $row.TargetEffectiveAction
-        }
-        elseif ($row.ReplacementRuleId) {
-            $label = "$($row.RuleId) -> $($row.ReplacementRuleId) (target $(Format-DrsParanoiaLevel $row.TargetReplacementParanoiaLevel))"
-            $sourceId = $row.RuleId
-            $state = $row.SourceEffectiveState
-            if ($row.SourceReplacementEffectiveState -ne 'Not present' -and
-                ($row.SourceEffectiveState -ne 'Enabled' -or $row.SourceReplacementEffectiveState -eq 'Enabled')) {
-                $sourceId = $row.ReplacementRuleId
-                $state = $row.SourceReplacementEffectiveState
-            }
-            $sourceText = "$sourceId $state"
-            $targetText = "$($row.ReplacementRuleId) $($row.ReplacementEffectiveState)"
         }
         elseif ($row.BaselineOnly -or ($row.RiskKinds.Count -eq 1 -and $row.RiskKinds[0] -eq 'SourceDisableChanged')) {
             $label = "Rule $($row.RuleId): $($Item.RuleDescription)"
@@ -2915,6 +3109,7 @@ function Get-DecisionOverview {
             if ($Item.Path -eq 'properties.policySettings') { $label = 'Policy settings' }
             elseif ($Item.Path -eq "properties.policySettings.$($Item.Key)") {
                 $label = switch ($Item.Key) {
+                    # Match portal terminology while retaining the underlying API field keys.
                     'requestBodyCheck' { 'Enable request body inspection' }
                     'customBlockResponseBody' { 'Block response body' }
                     'customBlockResponseStatusCode' { 'Block response status code' }
@@ -2940,8 +3135,9 @@ function Get-DecisionOverview {
             $targetText = 'Not included'
         }
     }
-    $customDetails = @{ Priority = '-'; Type = '-' }
+    $customDetails = @{ SourcePriority = '---'; TargetPriority = '---'; SelectedPriority = '---'; Selection = '---'; Type = '---' }
     if ($Item.Scope.StartsWith("Custom rule '", [StringComparison]::Ordinal)) {
+        # Preserve independent source/target priority and action details for the existing merge.
         $sourceText = if (-not $Item.SourcePresent) { '---' }
             elseif ($Item.SourceValue.Contains('enabledState')) { [string] $Item.SourceValue['enabledState'] }
             else { 'Enabled' }
@@ -2949,6 +3145,7 @@ function Get-DecisionOverview {
             elseif ($Item.TargetValue.Contains('enabledState')) { [string] $Item.TargetValue['enabledState'] }
             else { 'Enabled' }
         foreach ($column in 'Priority', 'Type') {
+            # Input priorities are separate values, not a source-to-master renumbering.
             $key = if ($column -eq 'Priority') { 'priority' } else { 'ruleType' }
             $sourceValue = if ($Item.SourcePresent -and $Item.SourceValue.Contains($key)) { [string] $Item.SourceValue[$key] } else { '---' }
             $targetValue = if ($Item.TargetPresent -and $Item.TargetValue.Contains($key)) { [string] $Item.TargetValue[$key] } else { '---' }
@@ -2956,9 +3153,33 @@ function Get-DecisionOverview {
                 $sourceValue = switch ($sourceValue) { 'MatchRule' { 'Match' }; 'RateLimitRule' { 'Rate limit' }; default { $sourceValue } }
                 $targetValue = switch ($targetValue) { 'MatchRule' { 'Match' }; 'RateLimitRule' { 'Rate limit' }; default { $targetValue } }
             }
-            $customDetails[$column] = if (-not $Item.SourcePresent) { $targetValue }
-                elseif (-not $Item.TargetPresent -or $sourceValue -eq $targetValue) { $sourceValue }
-                else { "$sourceValue -> $targetValue" }
+            if ($column -eq 'Priority') {
+                $customDetails.SourcePriority = if ($Item.SourcePresent -and $Item.SourceValue.Contains('priority')) {
+                    [string] $Item.SourcePriority
+                } else { '---' }
+                $customDetails.TargetPriority = $targetValue
+            } else {
+                $customDetails.Type = if (-not $Item.SourcePresent) { $targetValue }
+                    elseif (-not $Item.TargetPresent -or $sourceValue -eq $targetValue) { $sourceValue }
+                    else { "$sourceValue -> $targetValue" }
+            }
+        }
+        # Selected priorities are proposals until conflicting copies have been resolved.
+        switch ($Item.Choice) {
+            'KeepSource' {
+                $customDetails.Selection = if ($Item.SourcePresent) { 'Source' } else { 'Remove' }
+                $customDetails.SelectedPriority = if ($Item.SourcePresent -and $Item.SourceValue.Contains('priority')) {
+                    [string] $Item.SourceValue['priority']
+                } else { '---' }
+            }
+            'KeepTarget' {
+                $customDetails.Selection = if ($Item.TargetPresent) { 'Master' } else { 'Omit' }
+                $customDetails.SelectedPriority = $customDetails.TargetPriority
+            }
+            default {
+                $customDetails.Selection = 'Pending'
+                $customDetails.SelectedPriority = 'Pending'
+            }
         }
         if ($Item.SourcePresent) {
             $sourceAction = if ($Item.SourceValue.Contains('action')) { [string] $Item.SourceValue['action'] } else { '---' }
@@ -2973,20 +3194,17 @@ function Get-DecisionOverview {
     $targetText = $targetText -replace '^1 exclusions$', '1 exclusion' -replace 'AnomalyScoring', 'Anomaly scoring'
     $paranoiaLevel = '---'
     if ($Item.DecisionKind -eq 'DrsRisk' -and $Item.RiskContext.Count -eq 1) {
+        # Show PL from the rule's native side, including rules absent from the target.
         $activityRow = $Item.RiskContext[0]
-        if (-not $activityRow.ReplacementRuleId -and $activityRow.RuleId -ne 'All') {
+        if ($activityRow.RuleId -ne 'All') {
             $sourceSensitivity = if ($Item.RuleSetType -ceq 'Microsoft_HTTPDDoSRuleSet') { $activityRow.SourceSensitivity } else { $null }
             $targetSensitivity = if ($Item.RuleSetType -ceq 'Microsoft_HTTPDDoSRuleSet') { $activityRow.TargetSensitivity } else { $null }
             $sourceText = Format-DrsStatusAction $activityRow.SourceEffectiveState $activityRow.SourceEffectiveAction $sourceSensitivity
             $targetText = Format-DrsStatusAction $activityRow.TargetEffectiveState $activityRow.TargetEffectiveAction $targetSensitivity
         }
-        $hasTargetRule = if ($activityRow.ReplacementRuleId) {
-            $activityRow.ReplacementEffectiveState -ne 'Not present'
-        } else { $activityRow.RuleId -ne 'All' -and $activityRow.TargetEffectiveState -ne 'Not present' }
+        $hasTargetRule = $activityRow.RuleId -ne 'All' -and $activityRow.TargetEffectiveState -ne 'Not present'
         if ($hasTargetRule) {
-            $paranoiaLevel = if ($activityRow.ReplacementRuleId) {
-                Format-DrsParanoiaLevel $activityRow.TargetReplacementParanoiaLevel
-            } else { Format-DrsParanoiaLevel $activityRow.TargetParanoiaLevel }
+            $paranoiaLevel = Format-DrsParanoiaLevel $activityRow.TargetParanoiaLevel
         } elseif ($activityRow.RuleId -ne 'All') {
             $paranoiaLevel = Format-DrsParanoiaLevel $activityRow.SourceParanoiaLevel
         }
@@ -2995,18 +3213,19 @@ function Get-DecisionOverview {
     }
     [pscustomobject]@{
         Id = $Item.Id; Item = $label; Source = $sourceText; Target = $targetText
+        # Grouped coverage decisions and individual settings use distinct review scopes.
         ReviewScope = if ($Item.DecisionKind -eq 'DrsRisk') {
             if ($Item.RiskContext.Count -gt 1) { 'Individual rules' }
             elseif ($Item.RuleGroupName -eq '(rule-set scope)') { 'Rule set' }
             elseif ($Item.RuleId -eq 'All') { "Rule group: $($Item.RuleGroupName)" }
-            elseif ($Item.RiskContext[0].ReplacementRuleId) { "Rule replacement: $($Item.RuleGroupName)/$($Item.RuleId)" }
             else { "Rule: $($Item.RuleGroupName)/$($Item.RuleId)" }
         } else { '---' }
         ParanoiaLevel = $paranoiaLevel
         Name = if ($Item.DecisionKind -eq 'DrsRisk') {
             $label -replace '^Rule [^:]+: ', '' -replace ' \(target (?:PL[12]|Not documented)\)$', ''
         } else { $Item.IdentityValue }
-        Priority = $customDetails.Priority; Type = $customDetails.Type
+        SourcePriority = $customDetails.SourcePriority; TargetPriority = $customDetails.TargetPriority
+        SelectedPriority = $customDetails.SelectedPriority; Selection = $customDetails.Selection; Type = $customDetails.Type
     }
 }
 
@@ -3064,6 +3283,7 @@ function Write-DecisionSummary {
     $rows = @(foreach ($item in $Items) {
         $summaryRows = @(Get-DecisionOverview $item)
         foreach ($row in $summaryRows) {
+            # Attach choices and actionable warnings to the same rows the user reviews.
             if ($row.Source.EndsWith(' *', [StringComparison]::Ordinal) -or
                 $row.Target.EndsWith(' *', [StringComparison]::Ordinal)) {
                 if ($item.Path -eq 'properties.policySettings' -or
@@ -3078,7 +3298,8 @@ function Write-DecisionSummary {
                     "Row $($item.Id): KeepSource cannot be used: $issue"
                 }
                 if ($item.PriorityConflicts.Count -and $item.Choice -in 'Pending','KeepSource') {
-                    "Row $($item.Id): source priority $($item.SourcePriority) conflicts with $($item.PriorityConflicts -join ', '); KeepSource requires an unused priority."
+                    $certainty = if ($item.Choice -eq 'Pending') { 'may conflict with' } else { 'conflicts with' }
+                    "Row $($item.Id): selected source priority $($item.SourcePriority) $certainty $($item.PriorityConflicts -join ', '); KeepSource requires an unused priority if these rules are retained."
                 }
             )
             $row | Add-Member -NotePropertyName ReviewWarnings -NotePropertyValue $warnings
@@ -3092,6 +3313,7 @@ function Write-DecisionSummary {
             -Labels '#',Scope,'Match variable','Header name',Operator,'Value count',Source,Target -FlexibleProperty ReviewScope -ColumnSpacing 3 -Width $Width -RowColorProperty ReviewColor -SelectedColumnProperty ReviewSelectedColumn -RowWarningProperty ReviewWarnings
     } elseif ($exclusionsOnly) {
         foreach ($scopeKind in 'Rule set', 'Rule group', 'Individual rule') {
+            # Keep broad bypasses visibly separate from narrowly scoped exclusions.
             $scopeRows = @($rows | Where-Object ScopeKind -ceq $scopeKind)
             if (-not $scopeRows.Count) { continue }
             $scopeTitle = switch ($scopeKind) {
@@ -3109,8 +3331,10 @@ function Write-DecisionSummary {
             }
         }
     } elseif (-not @($Items | Where-Object { -not $_.Scope.StartsWith("Custom rule '", [StringComparison]::Ordinal) }).Count) {
-        Write-ResponsiveTable -Rows $rows -Properties Id,Priority,Name,Type,Source,Target `
-            -Labels '#',Priority,Name,'Rule type',Source,Target -FlexibleProperty Name -PaddingProperty Type -ColumnSpacing 3 -Width $Width -RowColorProperty ReviewColor -SelectedColumnProperty ReviewSelectedColumn -RowWarningProperty ReviewWarnings
+        Write-Host 'Source/Master priorities are input values. Selected is the proposed priority; lower numbers run first.'
+        Write-Host 'Conflicts require a new source priority; retained master rules are not renumbered automatically.'
+        Write-ResponsiveTable -Rows $rows -Properties Id,Name,Type,SourcePriority,TargetPriority,SelectedPriority,Selection,Source,Target `
+            -Labels '#',Name,'Rule type','Source pri.','Master pri.','Selected pri.',Selection,Source,Master -FlexibleProperty Name -ColumnSpacing 3 -Width $Width -RowColorProperty ReviewColor -SelectedColumnProperty ReviewSelectedColumn -RowWarningProperty ReviewWarnings
     } elseif (-not @($Items | Where-Object RuleSetType -ne 'Microsoft_DefaultRuleSet').Count) {
         Write-ResponsiveTable -Rows $rows -Properties Id,ReviewScope,Name,ParanoiaLevel,Source,Target `
             -Labels '#',Scope,Name,PL,Source,Target -FlexibleProperty Name -ColumnSpacing 3 -Width $Width -RowColorProperty ReviewColor -SelectedColumnProperty ReviewSelectedColumn -RowWarningProperty ReviewWarnings
@@ -3147,6 +3371,7 @@ function Write-DecisionTable {
     Write-DecisionSummary $policyItems 'Policy settings and tags' $width
     $managedItems = @($Items | Where-Object RuleSetType)
     foreach ($section in ($managedItems | Group-Object RuleSetType)) {
+        # Separate DRS exclusions from effective-rule changes; other families use their own tables.
         $familyHeader = Format-ManagedRuleSetHeader $section.Name
         if ($section.Name -eq 'Microsoft_DefaultRuleSet') {
             $exclusionItems = @($section.Group | Where-Object DecisionKind -eq 'DrsExclusion')
@@ -3180,14 +3405,14 @@ function Get-DrsBlockingIssues {
     $null = Get-DrsTargetVersion $Configuration
     return ,@(
         foreach ($type in (Get-ManagedRuleSetTypes)) {
+            # Validate the unmodified source against its own version before considering carryover.
             $version = Get-ManagedSourceVersion $drsSourceSnapshot $type
             if (-not $version) { continue }
             $sourceRules = Get-DrsEffectiveRules $drsSourceSnapshot $version $type
             foreach ($issue in (Get-DrsSourceBaselineIssues $drsSourceSnapshot $sourceRules $type)) {
                 [pscustomobject]@{
                     RuleSetType = $type; RuleGroupName = $issue.Group; RuleId = $issue.RuleId
-                    ReplacementRuleGroupName = ''; ReplacementRuleId = ''
-                    SourceEnabledState = $issue.State; TargetEnabledState = 'Unknown'; ReplacementEnabledState = 'Not applicable'
+                    SourceEnabledState = $issue.State
                     Message = $issue.Message
                 }
             }
@@ -3195,7 +3420,7 @@ function Get-DrsBlockingIssues {
     )
 }
 
-function Write-SupersessionBlockingIssues {
+function Write-MigrationBlockingIssues {
     <#
     .SYNOPSIS
     Prints explicit configuration or baseline errors that prevent template generation.
@@ -3208,7 +3433,7 @@ function Write-SupersessionBlockingIssues {
     $rows = @($Issues | ForEach-Object {
         [pscustomobject]@{
             Rule = $_.RuleId
-            Note = "Source original: $($_.SourceEnabledState); target original: $($_.TargetEnabledState); target replacement: $($_.ReplacementEnabledState). $($_.Message)"
+            Note = "Source state: $($_.SourceEnabledState). $($_.Message)"
         }
     })
     Write-ResponsiveTable -Rows $rows -Properties Rule,Note -Labels Rule,Error `
@@ -3220,8 +3445,8 @@ function Get-CustomPriorityConflicts {
     .SYNOPSIS
     Finds differently named custom rules occupying a candidate priority.
     .DESCRIPTION
-    Planning considers template and source proposals. KeepSource checks use only the
-    current selected target, allowing earlier choices to free a priority.
+    Planning overlays preset choices on the target and considers both alternatives
+    for pending source decisions. Execution can restrict checks to the current target.
     .PARAMETER Rule
     Candidate custom-rule dictionary.
     .PARAMETER CurrentTargetOnly
@@ -3232,7 +3457,15 @@ function Get-CustomPriorityConflicts {
     param([System.Collections.IDictionary] $Rule, [switch] $CurrentTargetOnly)
     $rules = Get-Collection $script:target['properties']['customRules'] 'rules'
     if (-not $CurrentTargetOnly) {
-        $rules += (Get-Collection $script:source['properties']['customRules'] 'rules')
+        # A selected source replaces its namesake; its old master priority is no longer occupied.
+        foreach ($decision in ($decisions | Where-Object Identity -eq 'name')) {
+            if ($decision.Choice -eq 'KeepSource') {
+                $rules = @($rules | Where-Object { $_['name'] -cne $decision.IdentityValue })
+            }
+            if ($decision.SourcePresent -and $decision.Choice -in 'KeepSource', 'Pending') {
+                $rules += @($decision.SourceValue)
+            }
+        }
     }
     return ,@($rules | Where-Object {
         $_['name'] -cne $Rule['name'] -and $_['priority'] -eq $Rule['priority']
@@ -3244,7 +3477,8 @@ function Resolve-CustomPriority {
     .SYNOPSIS
     Resolves an occupied custom-rule priority before applying KeepSource.
     .DESCRIPTION
-    Prompts only if the current target still conflicts; validates 1-1000 and vacancy.
+    Uses the chosen merged rules when all custom choices are known; otherwise checks
+    the current target. Prompts for a conflicting copy and validates 1-1000 and vacancy.
     Mutates the candidate and records its resolved priority without renumbering master rules.
     .PARAMETER Decision
     KeepSource custom-rule decision; non-custom decisions are unchanged.
@@ -3253,13 +3487,11 @@ function Resolve-CustomPriority {
     #>
     param($Decision)
     if ($Decision.Identity -ne 'name') { return }
-    # Earlier choices may have freed a priority flagged during initial planning.
-    $conflicts = Get-CustomPriorityConflicts $Decision.SourceValue -CurrentTargetOnly
-    if ($conflicts.Count -eq 0) {
-        if ($Decision.PriorityConflicts.Count) { $Decision.ResolvedPriority = $Decision.SourceValue['priority'] }
-        return
-    }
-    Write-Warning "Priority $($Decision.SourceValue['priority']) conflicts with $($conflicts -join ', '). Master rules will not be silently removed or renumbered."
+    # Known future source selections free old master slots and reserve their new priorities.
+    $currentTargetOnly = @($decisions | Where-Object { $_.Identity -eq 'name' -and $_.Choice -eq 'Pending' }).Count -gt 0
+    $conflicts = Get-CustomPriorityConflicts $Decision.SourceValue -CurrentTargetOnly:$currentTargetOnly
+    if ($conflicts.Count -eq 0) { return }
+    Write-Warning "Row $($Decision.Id): '$($Decision.IdentityValue)' needs priority $($Decision.SourceValue['priority']), already used by $($conflicts -join ', '). Retained master rules will not be removed or renumbered."
     do {
         $answer = (Read-Host "Choose an unused priority (1-1000) for '$($Decision.SourceValue['name'])', or Q to quit").Trim()
         if ($answer.ToUpperInvariant() -in 'Q', 'QUIT') { throw 'Migration cancelled. No ARM file was written.' }
@@ -3269,7 +3501,7 @@ function Resolve-CustomPriority {
             # Probe a copy so rejected priorities never alter the source candidate.
             $candidate = Copy-JsonValue $Decision.SourceValue
             $candidate['priority'] = $priority
-            $valid = (Get-CustomPriorityConflicts $candidate -CurrentTargetOnly).Count -eq 0
+            $valid = (Get-CustomPriorityConflicts $candidate -CurrentTargetOnly:$currentTargetOnly).Count -eq 0
         }
         if (-not $valid) { Write-Warning 'Enter an unused integer priority between 1 and 1000.' }
     } until ($valid)
@@ -3302,6 +3534,7 @@ function Get-DrsExclusionEntries {
         }
         foreach ($group in $groups) {
             foreach ($rule in (Get-Collection $group 'rules')) {
+                # Preserve individual scope identities rather than expanding inherited exclusions.
                 foreach ($exclusion in (Get-Collection $rule 'exclusions')) {
                     [pscustomobject]@{
                         ScopeKind = 'Individual rule'; GroupName = $group['ruleGroupName']
@@ -3328,11 +3561,12 @@ function Add-DrsExclusionDecisions {
     $pairs = @(
         foreach ($entry in $sourceEntries) {
             $targetEntry = $null
+            # Pair equivalent selector spellings only within the exact same scope.
             for ($index = 0; $index -lt $targetEntries.Count; $index++) {
                 $candidate = $targetEntries[$index]
                 if (-not $pairedTargetIndexes.Contains($index) -and
                     $entry.GroupName -ceq $candidate.GroupName -and $entry.RuleId -ceq $candidate.RuleId -and
-                    (Test-JsonEqual $entry.Exclusion $candidate.Exclusion)) {
+                    (Test-JsonEqual $entry.Exclusion $candidate.Exclusion 'exclusion')) {
                     $null = $pairedTargetIndexes.Add($index)
                     $targetEntry = $candidate
                     break
@@ -3358,6 +3592,7 @@ function Add-DrsExclusionDecisions {
             ($null -ne $pair.TargetEntry) $targetValue $pair.SourcePresent $sourceValue -DecisionKind DrsExclusion
         $decision = $decisions[$decisions.Count - 1]
         $decision.ExclusionContext = [pscustomobject]@{
+            # Shared occurrences remain in the target even when another occurrence is reviewed.
             ScopeKind = $entry.ScopeKind; GroupName = $entry.GroupName; RuleId = $entry.RuleId
             MatchVariable = $entry.Exclusion['matchVariable']; Operator = $entry.Exclusion['selectorMatchOperator']
             Selector = $entry.Exclusion['selector']
@@ -3479,6 +3714,7 @@ function Add-ManagedExceptionDecisions {
     $unmatched = @(
         foreach ($entry in $sourceEntries) {
             $found = $false
+            # Match complete predicates one-to-one so duplicate exception counts remain significant.
             for ($index = 0; $index -lt $targetEntries.Count; $index++) {
                 if (-not $matched.Contains($index) -and (Test-JsonEqual $entry $targetEntries[$index])) {
                     $null = $matched.Add($index)
@@ -3504,6 +3740,7 @@ function Add-ManagedExceptionDecisions {
         $decision.Scope = 'Request exception'
         $decision.Operation = 'Review'
         $decision.ExceptionContext = [pscustomobject]@{
+            # Retain the original target index for precise removal without exposing match values.
             TargetIndex = $pair.TargetIndex
             MatchVariable = $entry['matchVariable']; Operator = $entry['valueMatchOperator']
             Selector = if ($entry.Contains('selector')) { $entry['selector'] } else { '---' }
@@ -3575,6 +3812,7 @@ function Get-DrsApplicableExceptions {
             foreach ($exception in (Get-Collection $managed['exceptionsList'] 'exceptions')) {
                 $applies = $false
                 foreach ($scope in (Get-Collection $exception 'scopes')) {
+                    # Empty group/rule scopes inherit the entire containing managed scope.
                     if ($scope['ruleSetType'] -cne $RuleSetType) { continue }
                     $groups = Get-Collection $scope 'ruleGroupScopes'
                     if (-not $groups.Count) { $applies = $true }
@@ -3645,6 +3883,7 @@ function Get-DrsEffectiveRules {
             $sensitivity = if ($null -ne $rule -and $rule.Contains('sensitivity')) { $rule['sensitivity'] }
                 else { $definition['defaultSensitivity'] }
             $result.Add($id, [pscustomobject]@{
+                # Retain native defaults alongside effective tuning for version-aware comparison.
                 RuleId = $id; RuleGroupName = $groupName; RuleSetType = $RuleSetType; RuleSetVersion = $Version
                 RuleDescription = $definition['description']
                 DefaultState = [string] $definition['defaultState']
@@ -3671,7 +3910,7 @@ function Get-DrsEffectiveRules {
 function New-DrsRiskRow {
     <#
     .SYNOPSIS
-    Creates family-native baseline, tuning and DRS-only replacement review metadata.
+    Creates family-native, same-ID baseline and tuning review metadata.
     .DESCRIPTION
     Keeps original source and target definitions separate, including explicit absence states.
     #>
@@ -3680,12 +3919,12 @@ function New-DrsRiskRow {
         [string] $SourceVersion = $sourceOriginalDrsVersion, [string] $TargetVersion = (Get-DrsTargetVersion))
     [pscustomobject]@{
         RuleSetType = $RuleSetType
+        # Absence is explicit; another version's defaults must never fill a missing source rule.
         SourceRuleDescription = if ($null -ne $SourceRule) { $SourceRule.RuleDescription } else { '' }
         TargetRuleDescription = if ($null -ne $TargetRule) { $TargetRule.RuleDescription } else { '' }
         RuleId = $RuleId
         RuleGroupName = if ($null -ne $TargetRule) { $TargetRule.RuleGroupName }
             elseif ($null -ne $SourceRule) { $SourceRule.RuleGroupName } else { '(rule-set scope)' }
-        ReplacementRuleId = $null
         SupersededByRuleId = if ($RuleSetType -eq 'Microsoft_DefaultRuleSet' -and $supersededRuleIds.ContainsKey($RuleId)) { $supersededRuleIds[$RuleId] } else { $null }
         SupersedesRuleId = if ($RuleSetType -eq 'Microsoft_DefaultRuleSet') {
             @($supersededRuleIds.Keys | Where-Object { $supersededRuleIds[$_] -ceq $RuleId }) | Select-Object -First 1
@@ -3698,8 +3937,6 @@ function New-DrsRiskRow {
         TargetRuleSetVersion = $TargetVersion
         SourceParanoiaLevel = if ($null -ne $SourceRule) { $SourceRule.ParanoiaLevel } else { $null }
         TargetParanoiaLevel = if ($null -ne $TargetRule) { $TargetRule.ParanoiaLevel } else { $null }
-        SourceReplacementParanoiaLevel = $null
-        TargetReplacementParanoiaLevel = $null
         SourceDefaultState = if ($null -ne $SourceRule) { $SourceRule.DefaultState } else { 'Not present' }
         SourceDefaultAction = if ($null -ne $SourceRule) { $SourceRule.DefaultAction } else { 'Not present' }
         SourceDefaultSensitivity = if ($null -ne $SourceRule) { $SourceRule.DefaultSensitivity } else { $null }
@@ -3722,13 +3959,6 @@ function New-DrsRiskRow {
                 "Individual rule: $groupName/$RuleId"
             }
         )
-        SourceReplacementDefaultState = 'Not present'
-        SourceReplacementDefaultAction = 'Not present'
-        SourceReplacementExplicitState = 'Absent'
-        SourceReplacementEffectiveState = 'Not present'
-        SourceReplacementEffectiveAction = 'Not present'
-        SourceReplacementExclusionCount = 0
-        SourceReplacementExceptionCount = 0
         TargetDefaultState = if ($null -ne $TargetRule) { $TargetRule.DefaultState } else { 'Not present' }
         TargetDefaultAction = if ($null -ne $TargetRule) { $TargetRule.DefaultAction } else { 'Not present' }
         TargetExplicitState = if ($null -ne $TargetRule) { $TargetRule.ExplicitState } else { 'Absent' }
@@ -3738,12 +3968,6 @@ function New-DrsRiskRow {
         TargetPolicyState = if ($null -ne $TargetRule) { $TargetRule.PolicyState } else { 'Not present' }
         TargetPolicyMode = if ($null -ne $TargetRule) { $TargetRule.PolicyMode } else { 'Not present' }
         TargetRuleSetAction = if ($null -ne $TargetRule) { $TargetRule.RuleSetAction } else { 'Not present' }
-        ReplacementDefaultState = 'Not present'
-        ReplacementDefaultAction = 'Not present'
-        TargetReplacementExplicitState = 'Absent'
-        ReplacementEffectiveState = 'Not present'
-        ReplacementEffectiveAction = 'Not present'
-        ReplacementSensitivity = $null
         RiskKinds = @(); Reason = ''; Treatment = 'Silent'; BaselineOnly = $false
         CandidateOperations = @()
         ScopeKind = ''
@@ -3758,18 +3982,15 @@ function Get-DrsRiskSummary {
     Exposes native defaults and effective behavior for structured report consumers.
     #>
     param([object[]] $Rows)
-    return ,@($Rows | Select-Object RuleSetType, SourceRuleDescription, TargetRuleDescription, RuleId, RuleGroupName, ReplacementRuleId, SupersededByRuleId, SupersedesRuleId, TargetOverridesDefaults, SourceOverridesDefaults, SourceRuleSetVersion, TargetRuleSetVersion,
-        SourceParanoiaLevel, TargetParanoiaLevel, SourceReplacementParanoiaLevel, TargetReplacementParanoiaLevel,
+    return ,@($Rows | Select-Object RuleSetType, SourceRuleDescription, TargetRuleDescription, RuleId, RuleGroupName, SupersededByRuleId, SupersedesRuleId, TargetOverridesDefaults, SourceOverridesDefaults, SourceRuleSetVersion, TargetRuleSetVersion,
+        SourceParanoiaLevel, TargetParanoiaLevel,
         SourceDefaultState, SourceDefaultAction, SourceDefaultSensitivity, SourceSensitivity, TargetDefaultSensitivity,
         SourceExplicitState, SourceEffectiveState, SourceEffectiveAction,
         SourcePolicyState, SourcePolicyMode, SourceRuleSetAction,
         SourceStateTuned, SourceActionTuned, SourceExclusionCount, SourceExceptionCount, ExclusionScopes,
-        SourceReplacementDefaultState, SourceReplacementDefaultAction, SourceReplacementExplicitState,
-        SourceReplacementEffectiveState, SourceReplacementEffectiveAction, SourceReplacementExclusionCount,
-        SourceReplacementExceptionCount, TargetDefaultState, TargetDefaultAction,
-        TargetExplicitState, TargetEffectiveState, TargetEffectiveAction, TargetSensitivity, ReplacementDefaultState,
+        TargetDefaultState, TargetDefaultAction,
+        TargetExplicitState, TargetEffectiveState, TargetEffectiveAction, TargetSensitivity,
         TargetPolicyState, TargetPolicyMode, TargetRuleSetAction,
-        ReplacementDefaultAction, TargetReplacementExplicitState, ReplacementEffectiveState, ReplacementEffectiveAction, ReplacementSensitivity,
         RiskKinds, Reason, Treatment, BaselineOnly, ScopeKind)
 }
 
@@ -3858,6 +4079,7 @@ function Get-DrsSourceBaselineIssues {
     $index = Get-CatalogIndex $key
     return ,@(
         foreach ($group in (Get-Collection $set 'ruleGroupOverrides')) {
+            # Unknown original identities make source tuning unresolvable, not safely discardable.
             $name = [string] $group['ruleGroupName']
             if (-not $index.Groups.ContainsKey($name)) {
                 [pscustomobject]@{ Group = $name; RuleId = 'All'; State = 'Unknown'; Message = "Source group $name has no original-version baseline. Update the embedded catalog before assessing its tuning." }
@@ -3879,6 +4101,7 @@ function Get-DrsSourceBaselineIssues {
                 foreach ($scope in (Get-Collection $exception 'scopes')) {
                     if ($scope['ruleSetType'] -cne $RuleSetType) { continue }
                     foreach ($group in (Get-Collection $scope 'ruleGroupScopes')) {
+                        # Validate exception rule membership against the original source family.
                         $name = [string] $group['ruleGroupName']
                         if (-not $index.Groups.ContainsKey($name)) {
                             [pscustomobject]@{
@@ -3925,6 +4148,7 @@ function Get-DrsRiskPlan {
         $risks = [System.Collections.Generic.List[string]]::new()
         $manual = $false
         if ($null -ne $left) {
+            # Removed inspecting signatures need a review, never an invented replacement operation.
             if ($null -eq $right) {
                 if ($left.Inspecting -or $left.StateTuned -or $left.Exclusions.Count -or $left.Exceptions.Count) {
                     $risks.Add('RemovedSignature')
@@ -3967,10 +4191,11 @@ function Get-DrsRiskPlan {
         $reviewRisks = @($risks | Where-Object { $_ -ne 'RuleExclusionsChanged' })
         if ($risks.Count -and -not $reviewRisks.Count) { $row.Treatment = 'ExclusionReview' }
         if ($reviewRisks.Count -and $row.Treatment -ne 'BlockingError') {
+            # Only same-ID comparisons can produce an automatic source-copy operation.
             $row.Treatment = 'Decision'
             $row.Reason = "Migration risk: $($row.RiskKinds -join ', ')."
             if ($manual) {
-                $row.Reason += ' Review the replacement/template explicitly; legacy settings are not automatically remapped.'
+                $row.Reason += ' Review the target configuration explicitly; source settings are not remapped across rule IDs.'
             }
             elseif ($null -ne $left -and $null -ne $right) {
                 $row.CandidateOperations = @((New-DrsRuleOperation $left $right $row.RiskKinds $RuleSetType))
@@ -4063,6 +4288,7 @@ function Add-DrsScopeDecisions {
         @($targetRules.Values | Where-Object Inspecting).Count -gt 0
     if (-not $activeScope) { return }
     foreach ($key in 'ruleSetAction') {
+        # Ruleset enforcement is distinct from the anomaly-scoring action on an individual DRS rule.
         $defaultAction = if ($RuleSetType -eq 'Microsoft_DefaultRuleSet') { 'Block' } else { '---' }
         $sourceValue = $left[$key] ?? $defaultAction
         $targetValue = if ($null -ne $right) { $right[$key] ?? $defaultAction } else { $defaultAction }
@@ -4165,6 +4391,7 @@ function Get-CandidateCompatibilityIssues {
         return ,@(Get-CatalogIssues $fragment | Where-Object { $_.StartsWith('Exception', [StringComparison]::Ordinal) })
     }
     if ($Decision.DecisionKind -eq 'DrsExclusion') {
+        # Exclusion selectors can be retained only when their exact target scope still exists.
         if (-not $Decision.SourcePresent) { return ,@() }
         $context = $Decision.ExclusionContext
         $version = (Get-DrsTargetVersion) ?? (Get-LatestManagedRuleSetVersion 'Microsoft_DefaultRuleSet')
@@ -4185,7 +4412,7 @@ function Get-CandidateCompatibilityIssues {
                     return ,@("Rule $($row.RuleGroupName)/$($row.RuleId) exists in $($Decision.RuleSetType) v$($row.SourceRuleSetVersion), but not in target v$($row.TargetRuleSetVersion). KeepSource cannot copy it into that version. Use a master with a version containing this rule and rerun, or accept its absence with KeepTarget.")
                 }
             }
-            return ,@('No safe source-copy operation exists. Accept the target risk with KeepTarget, or update the template and rerun; no automatic legacy-to-replacement remapping is permitted.')
+            return ,@('No safe source-copy operation exists. Accept the target risk with KeepTarget, or update the template and rerun; settings cannot be remapped across rule IDs.')
         }
         $candidate = Copy-JsonValue $target
         Set-DrsRiskConfiguration $candidate $Decision.SourceValue $Decision.RuleSetType
@@ -4212,6 +4439,7 @@ function Get-CandidateCompatibilityIssues {
         $set[$Decision.Key] = Copy-JsonValue $Decision.SourceValue
     }
     elseif ($Decision.Identity -ne 'ruleSetType') {
+        # Isolate the proposed group/rule so unrelated source incompatibilities do not block it.
         if ($Decision.Identity -eq 'ruleGroupName') { $group = Copy-JsonValue $Decision.SourceValue }
         else {
             $groups = @($set['ruleGroupOverrides'] | Where-Object { $_['ruleGroupName'] -ceq $Decision.RuleGroupName })
@@ -4301,7 +4529,7 @@ function Merge-SourceConfiguration {
 function Set-DecisionOrder {
     <#
     .SYNOPSIS
-    Assigns portal-ordered review IDs and remaps dependencies before preset selection.
+    Assigns portal-ordered review IDs before preset selection.
     .DESCRIPTION
     Assigns stable review IDs in report order, with custom rules ordered by priority.
     #>
@@ -4311,6 +4539,7 @@ function Set-DecisionOrder {
         'enabledState', 'mode', 'logScrubbing'
     )
     $ordered = @($decisions | Sort-Object @{
+        # Stable portal-section ordering makes printed IDs usable for preset selections.
         Expression = {
             if ($_.Scope.StartsWith("Custom rule '", [StringComparison]::Ordinal)) { 3 }
             elseif ($_.DecisionKind -eq 'ManagedException') { 2 }
@@ -4322,6 +4551,7 @@ function Set-DecisionOrder {
             if ($_.Scope.StartsWith("Custom rule '", [StringComparison]::Ordinal)) {
                 if ($_.TargetPresent) { [int] $_.TargetValue['priority'] } else { [int] $_.SourceValue['priority'] }
             } elseif (-not $_.RuleSetType) {
+                # Policy settings follow portal order; custom rules retain priority ordering.
                 $settingName = ($_.Path -replace '^properties\.policySettings\.', '' -split '\.')[0]
                 $rank = [array]::IndexOf($policySettingOrder, $settingName)
                 if ($rank -ge 0) { $rank } else { $policySettingOrder.Count }
@@ -4339,12 +4569,6 @@ function Set-DecisionOrder {
     $decisions.Clear()
     foreach ($decision in $ordered) {
         $decision.Id = $idMap[$decision.Id]
-        if ($null -ne $decision.DependsOnDecisionId) {
-            if (-not $idMap.ContainsKey($decision.DependsOnDecisionId)) {
-                throw "Unresolved review dependency $($decision.DependsOnDecisionId)."
-            }
-            $decision.DependsOnDecisionId = $idMap[$decision.DependsOnDecisionId]
-        }
         $decisions.Add($decision)
     }
 }
@@ -4355,7 +4579,7 @@ function Add-Decision {
     Records one KeepSource/KeepTarget situation.
     .DESCRIPTION
     Captures candidate snapshots, a live target-parent reference for later mutation,
-    readable metadata, and supersession context. IDs are finalized in portal section
+    readable metadata, and native rule context. IDs are finalized in portal section
     order, with custom rules sorted by priority, before choices are applied.
     .PARAMETER Parent
     Target dictionary owning the field or keyed collection.
@@ -4405,6 +4629,7 @@ function Add-Decision {
     $operation = if ($DecisionKind -in 'TargetCustomRule', 'TargetPolicySetting') { 'Retain' } elseif ($TargetPresent) { 'Replace' } else { 'Add' }
     $display = Get-DecisionDisplay $Path
     $decisions.Add([pscustomobject]@{
+        # Candidate snapshots are immutable; Parent/Key identify the later mutation destination.
         Id = $decisions.Count + 1
         Path = $Path
         Operation = $operation
@@ -4426,15 +4651,10 @@ function Add-Decision {
         SourcePriority = if ($Identity -eq 'name' -and $SourcePresent) { $SourceValue['priority'] } else { $null }
         ResolvedPriority = $null
         PriorityConflicts = @()
-        SupersededRules = @()
-        GuidanceReviews = @()
         CompatibilityIssues = @()
         RiskContext = @()
         ExclusionContext = $null
         ExceptionContext = $null
-        TargetAdjustment = $null
-        DependsOnDecisionId = $null
-        NotApplicableReason = ''
     })
 }
 
@@ -4634,9 +4854,10 @@ function ConvertTo-ArmLiteral {
 
 #region Execution - policy inputs and master baseline
 # Protect input/output paths before Azure reads or prompts; Force must never overwrite an input.
-$sourceInput = Resolve-PolicyInput $SourcePolicyResourceId 'Source'
-$hasMasterPolicy = $PSBoundParameters.ContainsKey('MasterPolicyPath')
-$masterInput = if ($hasMasterPolicy) { Resolve-PolicyInput $MasterPolicyPath 'Master' } else { $null }
+Write-Host 'Loading and validating policy inputs...'
+$sourceInput = Resolve-PolicyInput $SourcePolicy 'Source'
+$hasMasterPolicy = $PSBoundParameters.ContainsKey('MasterPolicy')
+$masterInput = if ($hasMasterPolicy) { Resolve-PolicyInput $MasterPolicy 'Master' } else { $null }
 if (-not $OutputPath) { $OutputPath = Join-Path (Get-Location).Path "$TargetPolicyName.arm.json" }
 $outputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
 foreach ($protectedFile in @($sourceInput.FilePath, $(if ($hasMasterPolicy) { $masterInput.FilePath }), $PSCommandPath)) {
@@ -4654,6 +4875,8 @@ if (-not $ReportOnly) {
 $liveInputs = @($sourceInput, $masterInput | Where-Object { $null -ne $_ -and $_.ResourceId })
 $context = $null
 if ($liveInputs.Count) {
+    # Validate the caller's subscription without switching context or authenticating offline inputs.
+    Write-Host 'Checking the Azure context for resource-ID inputs...'
     $context = if ($null -ne $DefaultProfile) { $DefaultProfile } else { Get-AzContext -ErrorAction Stop }
     if ($null -eq $context -or $null -eq $context.Account -or $null -eq $context.Subscription) {
         throw 'No authenticated Az context. Run Connect-AzAccount and Set-AzContext first.'
@@ -4666,6 +4889,7 @@ if ($liveInputs.Count) {
 }
 
 if ($hasMasterPolicy) {
+    Write-Host $(if ($masterInput.ResourceId) { 'Reading the master policy from Azure (GET only)...' } else { 'Preparing the master policy from JSON...' })
     $master = Read-PolicyInput $masterInput
     if ($master['sku'] -isnot [System.Collections.IDictionary] -or $master['sku']['name'] -cne 'Premium_AzureFrontDoor') {
         throw 'Master must use Premium_AzureFrontDoor to support the target managed rules.'
@@ -4677,6 +4901,7 @@ if ($hasMasterPolicy) {
 #endregion
 
 #region Execution - Azure source and embedded managed-rule catalog
+Write-Host $(if ($sourceInput.ResourceId) { 'Reading the source policy from Azure (GET only)...' } else { 'Preparing the source policy from JSON...' })
 $sourceResource = Read-PolicyInput $sourceInput
 $sourcePolicyName = if ($sourceInput.ResourceId) { ($sourceInput.ResourceId -split '/')[-1] } else { [string] $sourceResource['name'] }
 $sourceOriginalDrs = @(
@@ -4687,6 +4912,7 @@ $sourceOriginalDrs = @(
     }
 )
 $sourceOriginalDrsVersion = if ($sourceOriginalDrs.Count) { [string] $sourceOriginalDrs[0]['ruleSetVersion'] } else { $null }
+Write-Host 'Loading embedded managed-rule catalogs and resolving native defaults...'
 $drsCatalog = Get-EmbeddedDrsCatalog
 $targetVersion = if ($hasMasterPolicy) { (Get-DrsTargetVersion) ?? '2.2' } else { '2.2' }
 $source = ConvertTo-PolicyConfiguration $sourceResource 'Source' -AllowMissingDefaultRuleSet -TargetDrsVersion $targetVersion
@@ -4703,15 +4929,14 @@ $drsRuleInventory = Get-DrsRuleInventory -TargetVersion (Get-DrsTargetVersion)
 
 #endregion
 
-#region Execution - supersession scan and decision planning
+#region Execution - baseline validation and decision planning
+Write-Host 'Validating policy baselines and comparing settings and custom rules...'
 Assert-TargetConfiguration $target
 $drsSourceSnapshot = Copy-JsonValue $source
 Sync-ManagedSourceVersions $source $target
-$targetAdjustments = @()
-$initialIssues = Get-DrsBlockingIssues
-$baselineIssues = @($initialIssues | Where-Object { -not $_.ReplacementRuleId })
+$baselineIssues = Get-DrsBlockingIssues
 if (-not $ReportOnly -and $baselineIssues.Count) {
-    Write-SupersessionBlockingIssues $baselineIssues
+    Write-MigrationBlockingIssues $baselineIssues
     throw 'Source baseline must be corrected before reviewing the target. No ARM file was written.'
 }
 if ($target['properties'].Contains('customRules')) {
@@ -4741,6 +4966,7 @@ foreach ($issue in ($sourceIssues | Where-Object { -not $_.StartsWith('Exception
 }
 Compare-Configuration $target $source
 Set-DecisionOrder
+Write-Host 'Comparing managed-rule behavior, exclusions, and request exceptions...'
 $drsRiskAnalysis = Get-DrsRiskPlan $drsSourceSnapshot
 Add-DrsScopeDecisions $drsSourceSnapshot
 Add-DrsExclusionDecisions $drsSourceSnapshot
@@ -4757,13 +4983,13 @@ $additionalManagedRiskAnalysis = @(
 )
 $allManagedRiskAnalysis = @($drsRiskAnalysis) + @($additionalManagedRiskAnalysis)
 $baselineRisks = @($allManagedRiskAnalysis | Where-Object {
-    $_.Treatment -eq 'Decision' -and $_.BaselineOnly -and -not $_.ReplacementRuleId -and $_.CandidateOperations.Count
+    $_.Treatment -eq 'Decision' -and $_.BaselineOnly -and $_.CandidateOperations.Count
 })
 foreach ($risk in $baselineRisks) {
     Add-DrsRiskDecision @($risk) $risk.CandidateOperations 'Default-driven protection loss' $risk.RuleSetType
 }
 foreach ($risk in ($allManagedRiskAnalysis | Where-Object {
-    $_.Treatment -eq 'Decision' -and (-not $_.BaselineOnly -or $_.ReplacementRuleId -or -not $_.CandidateOperations.Count)
+    $_.Treatment -eq 'Decision' -and (-not $_.BaselineOnly -or -not $_.CandidateOperations.Count)
 })) {
     Add-DrsRiskDecision @($risk) $risk.CandidateOperations -RuleSetType $risk.RuleSetType
 }
@@ -4779,6 +5005,7 @@ foreach ($type in 'Microsoft_BotManagerRuleSet', 'Microsoft_HTTPDDoSRuleSet') {
     foreach ($issue in ($sourceIssues | Where-Object {
         $_.Contains($type) -and -not $_.StartsWith('Exception', [StringComparison]::Ordinal)
     })) {
+        # Keep unsupported family carryover visible as a review, not a silent omission.
         $risk = New-DrsRiskRow 'All' $null $null $type `
             (Get-ManagedSourceVersion $drsSourceSnapshot $type) (Get-ManagedComparisonVersion $drsSourceSnapshot $type)
         $risk.Treatment = 'Decision'; $risk.RiskKinds = @('SourceCompatibility')
@@ -4787,28 +5014,42 @@ foreach ($type in 'Microsoft_BotManagerRuleSet', 'Microsoft_HTTPDDoSRuleSet') {
     }
 }
 Set-DecisionOrder
-# Retain the legacy result field; originals/replacements now have independent decisions.
-$supersessionNotices = @()
 $blockingIssues = Get-DrsBlockingIssues
 $keepSourceIds = Resolve-DecisionRanges $keepSourceRanges 'KeepSource' $decisions.Count
 $keepTargetIds = Resolve-DecisionRanges $keepTargetRanges 'KeepTarget' $decisions.Count
 # Choices annotate the report first; target mutations happen only in the non-report execution below.
-foreach ($decision in $decisions) {
-    $decision.CompatibilityIssues = Get-CandidateCompatibilityIssues $decision
-    if ($decision.Identity -eq 'name' -and $decision.SourcePresent) {
-        $decision.PriorityConflicts = Get-CustomPriorityConflicts $decision.SourceValue
+Write-Host "Checking compatibility for $($decisions.Count) review decisions..."
+$decisionNumber = 0
+try {
+    foreach ($decision in $decisions) {
+        # Use the actual decision count; compatibility checks can dominate startup time.
+        $decisionNumber++
+        Write-Progress -Id 1 -Activity 'Preparing WAF migration report' `
+            -Status "Checking decision $decisionNumber of $($decisions.Count)" `
+            -PercentComplete ([int] (100 * ($decisionNumber - 1) / $decisions.Count))
+        $decision.CompatibilityIssues = Get-CandidateCompatibilityIssues $decision
+        if ($keepSourceIds.Contains($decision.Id)) { $decision.Choice = 'KeepSource' }
+        elseif ($keepTargetIds.Contains($decision.Id)) { $decision.Choice = 'KeepTarget' }
+        # Automatic custom-rule union.
+        elseif ($Auto) {
+            # Preserve supported source behavior; unsupported managed candidates keep target and warn.
+            $decision.Choice = if ($decision.DecisionKind -eq 'TargetCustomRule' -or
+                ($decision.DecisionKind -in 'DrsRisk', 'DrsExclusion', 'ManagedException' -and
+                    $decision.CompatibilityIssues.Count)) { 'KeepTarget' } else { 'KeepSource' }
+        }
     }
-    if ($keepSourceIds.Contains($decision.Id)) { $decision.Choice = 'KeepSource' }
-    elseif ($keepTargetIds.Contains($decision.Id)) { $decision.Choice = 'KeepTarget' }
-    # Automatic custom-rule union.
-    elseif ($Auto) {
-        $decision.Choice = if ($decision.DecisionKind -eq 'TargetCustomRule') { 'KeepTarget' } else { 'KeepSource' }
-    }
+} finally {
+    Write-Progress -Id 1 -Activity 'Preparing WAF migration report' -Completed
+}
+# Calculate priority occupancy only after every preset choice is known.
+foreach ($decision in ($decisions | Where-Object { $_.Identity -eq 'name' -and $_.SourcePresent })) {
+    $decision.PriorityConflicts = Get-CustomPriorityConflicts $decision.SourceValue
 }
 #endregion
 
 #region Execution - report display and KeepSource/KeepTarget decisions
-Write-SupersessionBlockingIssues $blockingIssues
+Write-Host 'Analysis complete. Displaying policy comparisons.' -ForegroundColor Cyan
+Write-MigrationBlockingIssues $blockingIssues
 Write-DecisionTable $decisions.ToArray()
 if ($ReportOnly) { Write-Host "`nReport only: no file created and no Azure resources changed." }
 if (-not $ReportOnly -and $blockingIssues.Count) {
@@ -4823,10 +5064,6 @@ foreach ($decision in $decisions) {
 foreach ($decision in $decisions) {
     # Report-only never mutates the target, resolves priorities, or prompts, even with preset choices.
     if ($ReportOnly) { continue }
-    if ($decision.Choice -eq 'NotApplicable') {
-        Write-Host "`n[$($decision.Id)] $($decision.NotApplicableReason)" -ForegroundColor Cyan
-        continue
-    }
     if ($decision.DecisionKind -eq 'TargetCustomRule' -and $decision.Choice -eq 'KeepSource') {
         Remove-TargetTemplateRule $decision
         continue
@@ -4853,6 +5090,7 @@ foreach ($decision in $decisions) {
     } until ($answer -in $allowedAnswers)
     if ($answer -in 'Q', 'QUIT') { throw 'Migration cancelled. No ARM file was written.' }
     if ($answer -in 'S', 'SOURCE', 'KEEPSOURCE') {
+        # Validate each selected copy; scoped bypasses are applied together after all reviews.
         if ($decision.DecisionKind -eq 'TargetCustomRule') { Remove-TargetTemplateRule $decision }
         else {
             Assert-KeepSourceCompatibility $decision
@@ -4882,7 +5120,7 @@ if (-not $ReportOnly) {
     Assert-TargetConfiguration $target
     $selectedTargetIssues = Get-DrsBlockingIssues
     if ($selectedTargetIssues.Count) {
-        Write-SupersessionBlockingIssues $selectedTargetIssues
+        Write-MigrationBlockingIssues $selectedTargetIssues
         throw 'Selected configuration has blocking DRS errors. Correct the reported template/source-baseline issues and rerun; no ARM file was written.'
     }
     # Resource-group scope comes from the template schema and the user's deployment command.
@@ -4940,9 +5178,6 @@ $summary = [pscustomobject]@{
     OutputPath = if ($ReportOnly) { $null } else { $outputFile }
     DecisionCount = $decisions.Count
     PendingDecisionCount = @($decisions | Where-Object Choice -eq 'Pending').Count
-    TargetAdjustmentCount = $targetAdjustments.Count
-    PendingTargetAdjustmentCount = @($targetAdjustments | Where-Object Choice -eq 'Pending').Count
-    TargetAdjustments = $targetAdjustments
     SourceCompatibilityIssues = $sourceIssues
     DrsRuleInventory = $drsRuleInventory
     ManagedRuleInventory = @(Get-ManagedCatalogInventory)
@@ -4959,16 +5194,15 @@ $summary = [pscustomobject]@{
         $decisions | Where-Object DecisionKind -eq 'DrsRisk' |
             ForEach-Object { $_.RiskContext } | Where-Object { $_.RuleId -eq 'All' -and $_.RuleSetType -eq 'Microsoft_DefaultRuleSet' }
     )
-    SupersessionNotices = $supersessionNotices
     BlockingIssueCount = $blockingIssues.Count
     BlockingIssues = $blockingIssues
     CustomRuleBehaviorAssessments = $sourceCustomRuleBehaviorAssessments
     Decisions = @(
         if ($ReportOnly) {
-            $decisions | Select-Object Id, Scope, RuleSetType, RuleGroupName, RuleId, RuleDescription, Operation, DecisionKind, SourcePresent, TargetPresent, Choice, SourcePriority, ResolvedPriority, PriorityConflicts, SupersededRules, GuidanceReviews, CompatibilityIssues, RiskContext, ExclusionContext, ExceptionContext, DependsOnDecisionId, NotApplicableReason
+            $decisions | Select-Object Id, Scope, RuleSetType, RuleGroupName, RuleId, RuleDescription, Operation, DecisionKind, SourcePresent, TargetPresent, Choice, SourcePriority, ResolvedPriority, PriorityConflicts, CompatibilityIssues, RiskContext, ExclusionContext, ExceptionContext
         }
         else {
-            $decisions | Select-Object Id, Scope, RuleSetType, RuleGroupName, RuleId, RuleDescription, Operation, DecisionKind, TargetPresent, TargetValue, SourcePresent, SourceValue, Choice, SourcePriority, ResolvedPriority, PriorityConflicts, SupersededRules, GuidanceReviews, CompatibilityIssues, RiskContext, ExclusionContext, ExceptionContext, DependsOnDecisionId, NotApplicableReason
+            $decisions | Select-Object Id, Scope, RuleSetType, RuleGroupName, RuleId, RuleDescription, Operation, DecisionKind, TargetPresent, TargetValue, SourcePresent, SourceValue, Choice, SourcePriority, ResolvedPriority, PriorityConflicts, CompatibilityIssues, RiskContext, ExclusionContext, ExceptionContext
         }
     )
 }

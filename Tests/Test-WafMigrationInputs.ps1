@@ -16,6 +16,7 @@ $mockState = @{
     ReadPaths = [System.Collections.Generic.List[string]]::new()
     ContextCalls = 0; AllowContext = $true; ContextAvailable = $true
 }
+$startupProgress = [System.Collections.Generic.List[object]]::new()
 $mockState.Context = [pscustomobject]@{
     Account = [pscustomobject]@{ Id = 'LocalRegression' }
     Subscription = [pscustomobject]@{ Id = $subscriptionId }
@@ -71,6 +72,21 @@ function Invoke-AzRestMethod {
         else { throw "Unexpected ARM read: $Path" }
     $mockState.ReadPaths.Add($Path)
     [pscustomobject]@{ StatusCode = 200; Content = ConvertTo-Json $fixture -Depth 100 }
+}
+
+function Write-Progress {
+    <#
+    .SYNOPSIS
+    Captures compatibility progress without relying on a terminal renderer.
+    .DESCRIPTION
+    Records updates and completion so startup feedback can be tested independently
+    of the host's progress preferences.
+    #>
+    param([int] $Id, [string] $Activity, [string] $Status, [int] $PercentComplete, [switch] $Completed)
+    $startupProgress.Add([pscustomobject]@{
+        Id = $Id; Activity = $Activity; Status = $Status
+        PercentComplete = $PercentComplete; Completed = [bool] $Completed
+    })
 }
 
 function Assert-Equal {
@@ -157,12 +173,17 @@ try {
 
     $mockState.AllowContext = $false
     $mockState.ReadPaths.Clear()
-    foreach ($arguments in @(
-        @{ SourcePolicyResourceId = $sourceFile; MasterPolicyPath = $masterFile }
-        @{ SourcePolicyPath = $sourceFile; MasterPolicyResourceId = $masterFile }
-    )) {
-        $report = & $migrationPath @arguments -TargetPolicyName AliasTest -ReportOnly 3>$null 6>$null
-        Assert-Equal $report.DecisionCount 1 'Legacy parameter names and new aliases accept either input format'
+    $parameters = (Get-Command $migrationPath).Parameters
+    foreach ($name in 'SourcePolicy', 'MasterPolicy') {
+        Assert-Equal $parameters.ContainsKey($name) $true "$name is a canonical parameter"
+        Assert-Equal $parameters[$name].Aliases.Count 0 "$name has no legacy aliases"
+    }
+    foreach ($name in 'SourcePolicyResourceId', 'SourcePolicyPath', 'MasterPolicyPath', 'MasterPolicyResourceId',
+        'UseRecommendedTarget') {
+        Assert-Equal $parameters.ContainsKey($name) $false "$name is not an exposed option"
+        Assert-InputFailure @{
+            SourcePolicy = $sourceFile; TargetPolicyName = 'RemovedOptionTest'; ReportOnly = $true; $name = '1'
+        } "*parameter cannot be found*'$name'*"
     }
     $explicitContext = [Microsoft.Azure.Commands.Profile.Models.Core.PSAzureContext]::new()
     $explicitContext.Account = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureAccount]::new()
@@ -203,7 +224,7 @@ try {
             matchConditions = @(@{ matchVariable = 'RequestUri'; operator = 'Contains'; matchValue = @('/source-shared') })
         },
         @{
-            name = 'SourceOnlyRule'; enabledState = 'Enabled'; priority = 11
+            name = 'SourceOnlyRule'; enabledState = 'Enabled'; priority = 20
             ruleType = 'MatchRule'; action = 'Log'
             matchConditions = @(@{ matchVariable = 'RequestUri'; operator = 'Contains'; matchValue = @('/source-only') })
         }
@@ -250,8 +271,29 @@ try {
     )
     $autoSourceFile = Write-InputFixture 'auto-source.json' $autoSource
     $autoMasterFile = Write-InputFixture 'auto-master.json' $autoMaster
-    $autoReport = & $migrationPath -SourcePolicy $autoSourceFile -MasterPolicy $autoMasterFile `
-        -TargetPolicyName AutoReportTest -Auto -ReportOnly 3>$null 6>$null
+    $startupProgress.Clear()
+    $autoRecords = @(& $migrationPath -SourcePolicy $autoSourceFile -MasterPolicy $autoMasterFile `
+        -TargetPolicyName AutoReportTest -Auto -ReportOnly 3>$null 6>&1)
+    $autoSummaries = @($autoRecords | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
+    Assert-Equal $autoSummaries.Count 1 'Startup feedback does not contaminate the success-stream summary'
+    $autoReport = $autoSummaries[0]
+    $startupMessages = @($autoRecords | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } |
+        ForEach-Object { [string] $_.MessageData })
+    Assert-Equal $startupMessages[0] 'Preparing WAF migration. Azure resources will not be changed.' 'The first executable startup phase announces read-only preparation'
+    Assert-Equal ($startupMessages -contains 'Loading and validating policy inputs...') $true 'Input loading is announced'
+    Assert-Equal ($startupMessages -contains 'Loading embedded managed-rule catalogs and resolving native defaults...') $true 'Catalog loading is announced'
+    Assert-Equal ($startupMessages -contains 'Comparing managed-rule behavior, exclusions, and request exceptions...') $true 'Managed-rule comparison is announced'
+    Assert-Equal ($startupMessages -contains 'Analysis complete. Displaying policy comparisons.') $true 'Analysis completion precedes the comparison report'
+
+    # Progress measures completed work against the actual count and is cleared before display.
+    $activeProgress = @($startupProgress | Where-Object { -not $_.Completed })
+    Assert-Equal $activeProgress.Count $autoReport.DecisionCount 'Every compatibility decision has a progress update'
+    for ($index = 0; $index -lt $activeProgress.Count; $index++) {
+        Assert-Equal $activeProgress[$index].Status "Checking decision $($index + 1) of $($autoReport.DecisionCount)" 'Progress uses exact decision counts'
+        Assert-Equal $activeProgress[$index].PercentComplete ([int] (100 * $index / $autoReport.DecisionCount)) 'Progress percentage reflects completed checks'
+    }
+    Assert-Equal @($startupProgress | Where-Object Completed).Count 1 'The compatibility progress bar is completed once'
+    Assert-Equal $startupProgress[$startupProgress.Count - 1].Completed $true 'Progress is cleared after all checks'
     Assert-Equal $autoReport.OutputPath $null 'Automatic report-only mode writes no output'
     Assert-Equal $autoReport.PendingDecisionCount 0 'Automatic mode resolves every displayed decision'
     Assert-Equal @($autoReport.Decisions | Where-Object {
@@ -260,6 +302,7 @@ try {
     Assert-Equal @($autoReport.Decisions | Where-Object {
         $_.DecisionKind -ne 'TargetCustomRule' -and $_.Choice -ne 'KeepSource'
     }).Count 0 'Automatic mode selects source for every other decision'
+    Assert-Equal @($autoReport.Decisions | Where-Object { $_.PriorityConflicts.Count }).Count 0 'Automatic preview does not warn about the shared master priority freed by source selection'
 
     $autoOutputFile = Join-Path $testDirectory 'auto-generated.arm.json'
     $autoResult = & $migrationPath -SourcePolicy $autoSourceFile -MasterPolicy $autoMasterFile `
@@ -275,6 +318,7 @@ try {
     Assert-Equal $generatedCustomRules.SharedRule.action 'Block' 'Automatic mode selects source for a shared custom rule'
     Assert-Equal $generatedCustomRules.SharedRule.priority 10 'Shared custom rule keeps the source priority'
     Assert-Equal $generatedCustomRules.SourceOnlyRule.action 'Log' 'Automatic mode retains a source-only custom rule'
+    Assert-Equal $generatedCustomRules.SourceOnlyRule.priority 20 'A source-only rule keeps the priority freed by a shared source choice'
     Assert-Equal $generatedCustomRules.TargetOnlyRule.action 'Block' 'Automatic mode retains a target-only custom rule'
     $generatedDrs = @($autoResource.properties.managedRules.managedRuleSets |
         Where-Object ruleSetType -EQ 'Microsoft_DefaultRuleSet')[0]
@@ -291,6 +335,179 @@ try {
     }
     Write-Host 'PASS: automatic report, generation, custom-rule union, source exclusions and manual-selection rejection'
 
+    $compatibleSource = $sourceFixture | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
+    $compatibleSource.properties.managedRules.managedRuleSets = @(
+        @{
+            ruleSetType = 'Microsoft_DefaultRuleSet'; ruleSetVersion = '2.2'; ruleSetAction = 'Block'
+            ruleGroupOverrides = @()
+        }
+        @{
+            ruleSetType = 'Microsoft_BotManagerRuleSet'; ruleSetVersion = '1.1'
+            ruleGroupOverrides = @(@{
+                ruleGroupName = 'BadBots'
+                rules = @(
+                    @{ ruleId = 'Bot100100'; action = 'Log' }
+                    @{ ruleId = 'Bot100300'; action = 'Log' }
+                )
+            })
+        }
+    )
+    $compatibleSource.properties.managedRules.exceptionsList = @{ exceptions = @(@{
+        matchVariable = 'RequestUri'; valueMatchOperator = 'Equals'; matchValues = @('/trusted')
+        scopes = @(@{
+            ruleSetType = 'Microsoft_BotManagerRuleSet'; ruleSetVersion = '1.1'
+            ruleGroupScopes = @(@{ ruleGroupName = 'BadBots'; ruleScopes = @(@{ ruleId = 'Bot100300' }) })
+        })
+    }) }
+    $compatibleMaster = $compatibleSource | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
+    $compatibleMaster.properties.managedRules.managedRuleSets[1].ruleSetVersion = '1.0'
+    $compatibleMaster.properties.managedRules.managedRuleSets[1].ruleGroupOverrides = @()
+    $null = $compatibleMaster.properties.managedRules.Remove('exceptionsList')
+    $compatibleSourceFile = Write-InputFixture 'compatibility-source.json' $compatibleSource
+    $compatibleMasterFile = Write-InputFixture 'compatibility-master.json' $compatibleMaster
+    $compatibleOutput = Join-Path $testDirectory 'compatibility.arm.json'
+    $records = @(& $migrationPath -SourcePolicy $compatibleSourceFile -MasterPolicy $compatibleMasterFile `
+        -TargetPolicyName CompatibilityTest -Auto -OutputPath $compatibleOutput 3>&1 6>&1)
+    $compatibleReport = @($records | Where-Object { $null -ne $_.PSObject.Properties['Decisions'] })[0]
+    $unsupported = @($compatibleReport.Decisions | Where-Object { $_.CompatibilityIssues.Count })
+    Assert-Equal ($unsupported.Count -gt 0) $true 'The downgrade has explicitly unsupported source choices'
+    Assert-Equal @($unsupported | Where-Object Choice -ne 'KeepTarget').Count 0 'Automatic mode retains target for unsupported managed carryover'
+    Assert-Equal (($records -join "`n").Contains('KeepSource cannot be used')) $true 'Unsupported automatic carryover has visible compatibility diagnostics'
+    $compatibleTemplate = Get-Content -LiteralPath $compatibleOutput -Raw | ConvertFrom-Json -AsHashtable
+    $compatibleManaged = $compatibleTemplate.resources[0].properties.managedRules
+    $compatibleBot = @($compatibleManaged.managedRuleSets | Where-Object ruleSetType -EQ 'Microsoft_BotManagerRuleSet')[0]
+    Assert-Equal $compatibleBot.ruleSetVersion '1.0' 'Automatic mode retains the configured target version'
+    $compatibleRules = @($compatibleBot.ruleGroupOverrides.rules)
+    Assert-Equal @($compatibleRules | Where-Object ruleId -EQ 'Bot100300').Count 0 'Unsupported source IDs are not copied or remapped'
+    Assert-Equal @($compatibleRules | Where-Object ruleId -EQ 'Bot100100')[0].action 'Log' 'Supported source tuning survives alongside unsupported settings'
+    Assert-Equal $compatibleManaged.ContainsKey('exceptionsList') $false 'An unsupported source exception is not imported'
+    Assert-Equal $compatibleReport.PendingDecisionCount 0 'Unsupported carryover does not leave automatic decisions pending'
+    Write-Host 'PASS: automatic compatibility filtering retains supported source tuning without remapping unsupported scopes'
+
+    # Load the pinned definitions to check every common rule's generated effective behavior.
+    $catalogTokens = $null
+    $catalogErrors = $null
+    $catalogAst = [System.Management.Automation.Language.Parser]::ParseFile($migrationPath, [ref] $catalogTokens, [ref] $catalogErrors)
+    Assert-Equal $catalogErrors.Count 0 'The embedded catalog script parses'
+    foreach ($name in 'Get-EmbeddedDrsCatalog', 'Get-EmbeddedAdditionalManagedCatalog') {
+        $definition = $catalogAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        Invoke-Expression $definition.Extent.Text
+    }
+    $catalog = Get-EmbeddedDrsCatalog
+    $native20 = $catalog['Microsoft_DefaultRuleSet/2.0'].ruleGroups
+    Assert-Equal $native20.Count 17 'DRS 2.0 has exactly 17 native groups'
+    Assert-Equal @($native20.rules).Count 170 'DRS 2.0 has exactly 170 native rules'
+    Assert-Equal @($native20.rules | Where-Object defaultState -EQ 'Disabled').Count 8 'DRS 2.0 keeps its eight native disabled defaults'
+    Assert-Equal @($native20.rules | Where-Object { $_.paranoiaLevel -eq 2 -and $_.defaultState -eq 'Enabled' }).Count 49 'DRS 2.0 has 49 enabled PL2 rules, independent of the 2.2 baseline'
+
+    $savedSourceFixture = $sourceFixture
+    try {
+        $sourceFixture = $savedSourceFixture | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
+        $sourceFixture.properties.managedRules.managedRuleSets = @(@{
+            ruleSetType = 'Microsoft_DefaultRuleSet'; ruleSetVersion = '2.0'; ruleSetAction = 'Log'
+            exclusions = @(@{ matchVariable = 'RequestHeaderNames'; selectorMatchOperator = 'Equals'; selector = 'X-Source' })
+            ruleGroupOverrides = @(@{
+                ruleGroupName = 'SQLI'
+                exclusions = @(@{ matchVariable = 'QueryStringArgNames'; selectorMatchOperator = 'Equals'; selector = 'MixedArg' })
+                rules = @(
+                    @{ ruleId = '942100'; action = 'Log' }
+                    @{
+                        ruleId = '942200'; enabledState = 'Disabled'; action = 'Log'
+                        exclusions = @(@{ matchVariable = 'RequestCookieNames'; selectorMatchOperator = 'Equals'; selector = 'SourceCookie' })
+                    }
+                )
+            }, @{
+                ruleGroupName = 'MS-ThreatIntel-WebShells'
+                rules = @(@{ ruleId = '99005006'; enabledState = 'Disabled'; action = 'Log' })
+            })
+        })
+        $source20File = Write-InputFixture 'source20.json' $sourceFixture
+        # Exercise both target baselines with the same native 2.0 defaults and tuning.
+        foreach ($targetVersion in '2.1', '2.2') {
+            $master20 = $sourceFixture | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
+            $master20.properties.managedRules.managedRuleSets[0].ruleSetVersion = $targetVersion
+            $master20.properties.managedRules.managedRuleSets[0].ruleSetAction = 'Block'
+            $master20.properties.managedRules.managedRuleSets[0].ruleGroupOverrides = @()
+            $master20File = Write-InputFixture "master-$targetVersion.json" $master20
+            # Live reads are mocked; generated ARM must be identical in effective behavior.
+            foreach ($inputKind in 'JSON', 'ResourceId') {
+                $mockState.AllowContext = $inputKind -eq 'ResourceId'
+                $mockState.ReadPaths.Clear()
+                $output20 = Join-Path $testDirectory "source20-$targetVersion-$inputKind.arm.json"
+                $arguments = @{
+                    SourcePolicy = if ($inputKind -eq 'ResourceId') { $sourceId } else { $source20File }
+                    MasterPolicy = $master20File; TargetPolicyName = 'Source20Test'; Auto = $true; OutputPath = $output20
+                }
+                $report20 = & $migrationPath @arguments 3>$null 6>$null
+                Assert-Equal $mockState.ReadPaths.Count ([int] ($inputKind -eq 'ResourceId')) 'DRS 2.0 reads Azure only for a resource-ID input'
+                Assert-Equal $report20.SourceRuleSetVersion '2.0' 'The original 2.0 source version is retained in reports'
+                Assert-Equal $report20.TargetRuleSetVersion $targetVersion 'A master preserves its declared target version'
+                Assert-Equal @($report20.DrsRuleInventory | Where-Object RuleSetVersion -EQ '2.0').Count 170 'The structured inventory includes every native 2.0 rule'
+                Assert-Equal $report20.PendingDecisionCount 0 'Automatic DRS 2.0 migration resolves every decision'
+                $generated20 = Get-Content -LiteralPath $output20 -Raw | ConvertFrom-Json -AsHashtable
+                $set20 = $generated20.resources[0].properties.managedRules.managedRuleSets[0]
+                Assert-Equal $set20.ruleSetAction 'Log' 'Automatic migration preserves the source ruleset action'
+                Assert-Equal $set20.exclusions[0].selector 'X-Source' 'Source ruleset exclusions are preserved'
+                $groups20 = @{}
+                foreach ($group in $set20.ruleGroupOverrides) { $groups20[$group.ruleGroupName] = $group }
+                Assert-Equal $groups20.SQLI.exclusions[0].selector 'MixedArg' 'Source group exclusions preserve argument case'
+                $generatedRule200 = @($groups20.SQLI.rules | Where-Object ruleId -EQ '942200')[0]
+                Assert-Equal $generatedRule200.exclusions[0].selector 'SourceCookie' 'Source rule exclusions are preserved'
+                # Compare native defaults plus explicit tuning, never just the emitted override count.
+                foreach ($group in $native20) {
+                    $defaults = @($catalog["Microsoft_DefaultRuleSet/$targetVersion"].ruleGroups |
+                        Where-Object ruleGroupName -CEQ $group.ruleGroupName)[0]
+                    foreach ($rule in $group.rules) {
+                        # Resolve sparse overrides against target defaults before checking source fidelity.
+                        $targetRules = @($defaults.rules | Where-Object ruleId -CEQ $rule.ruleId)
+                        $override = @(
+                            if ($groups20.ContainsKey($group.ruleGroupName)) {
+                                $groups20[$group.ruleGroupName].rules | Where-Object ruleId -CEQ $rule.ruleId
+                            }
+                        )
+                        if (-not $targetRules.Count) {
+                            Assert-Equal $override.Count 0 "Removed source rule $($rule.ruleId) is not emitted in target $targetVersion"
+                            continue
+                        }
+                        $targetRule = $targetRules[0]
+                        $state = if ($override.Count -and $override[0].ContainsKey('enabledState')) {
+                            $override[0].enabledState
+                        } else { $targetRule.defaultState }
+                        $action = if ($override.Count -and $override[0].ContainsKey('action')) {
+                            $override[0].action
+                        } else { $targetRule.defaultAction }
+                        $expectedState = if ($rule.ruleId -eq '942200') { 'Disabled' } else { $rule.defaultState }
+                        $expectedAction = if ($rule.ruleId -in '942100', '942200', '99005006') { 'Log' } else { $rule.defaultAction }
+                        Assert-Equal $state $expectedState "$inputKind target $targetVersion preserves source state for $($rule.ruleId)"
+                        Assert-Equal $action $expectedAction "$inputKind target $targetVersion preserves source action for $($rule.ruleId)"
+                    }
+                }
+            }
+        }
+        # Without a master, source 2.0 still uses the 2.2 baseline; 1.2 must fail explicitly.
+        $mockState.AllowContext = $false
+        $mockState.ReadPaths.Clear()
+        $default20Output = Join-Path $testDirectory 'source20-default.arm.json'
+        $default20 = & $migrationPath -SourcePolicy $source20File -TargetPolicyName Default20Test `
+            -Auto -OutputPath $default20Output 3>$null 6>$null
+        Assert-Equal $default20.TargetRuleSetVersion '2.2' 'Masterless DRS 2.0 migration uses 2.2'
+        $default20Template = Get-Content -LiteralPath $default20Output -Raw | ConvertFrom-Json -AsHashtable
+        $default20Rules = @($default20Template.resources[0].properties.managedRules.managedRuleSets[0].ruleGroupOverrides.rules)
+        Assert-Equal @($default20Rules | Where-Object ruleId -EQ '99005002')[0].enabledState 'Enabled' 'Masterless automatic migration restores native source PL2 coverage'
+        $unsupported12 = $sourceFixture | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
+        $unsupported12.properties.managedRules.managedRuleSets[0].ruleSetVersion = '1.2'
+        $unsupported12File = Write-InputFixture 'unsupported12.json' $unsupported12
+        Assert-InputFailure @{ SourcePolicy = $unsupported12File; TargetPolicyName = 'Unsupported12Test'; ReportOnly = $true } '*does not support managed rule set Microsoft_DefaultRuleSet/1.2*'
+    } finally {
+        $sourceFixture = $savedSourceFixture
+        $mockState.AllowContext = $false
+        $mockState.ReadPaths.Clear()
+    }
+    Write-Host 'PASS: native DRS 2.0 inventory and automatic state/action/exclusion preservation for JSON and live-ID inputs'
+
     foreach ($protectedFile in $sourceFile, $masterFile, $migrationPath) {
         Assert-InputFailure @{
             SourcePolicy = $sourceFile; MasterPolicy = $masterFile
@@ -300,7 +517,7 @@ try {
     Assert-Equal (Get-FileHash -LiteralPath $sourceFile).Hash $sourceHash 'Source file is unchanged'
     Assert-Equal (Get-FileHash -LiteralPath $masterFile).Hash $masterHash 'Master file is unchanged'
     Assert-Equal $mockState.ReadPaths.Count 0 'File inputs with embedded IDs never fetch Azure values'
-    Write-Host 'PASS: aliases, masterless files, ARM generation, escaped literals and input/output protection'
+    Write-Host 'PASS: canonical parameters, masterless files, ARM generation, escaped literals and input/output protection'
 
     foreach ($invalid in @(
         @{ Name = 'array.json'; Document = @($sourceFixture); Pattern = '*JSON must be a resource object or an ARM template object*' }

@@ -251,6 +251,77 @@ try {
     }
     Assert-Equal @($target.properties.customRules.rules.priority | Sort-Object -Unique).Count 4 'The selected custom-rule union has unique priorities'
     Assert-Equal $retained.priority 30 'Priority resolution never renumbers retained master rules'
+
+    # Accepting a suggestion produces a resolution panel, not a second warning about the same row.
+    Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Suggested]' `
+        $false $null $true @{ name = 'Suggested'; priority = 30; ruleType = 'MatchRule'; action = 'Block' } 'name' 'Suggested'
+    $suggestedDecision = $decisions[4]
+    $suggestedDecision.Choice = 'KeepSource'
+    $script:priorityAnswers.Enqueue('')
+    $resolutionRecords = @(Resolve-CustomPriority $suggestedDecision 3>&1 6>&1)
+    Assert-Equal @($resolutionRecords | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count 0 'A valid priority fix does not repeat the comparison warning'
+    Assert-Equal $suggestedDecision.ResolvedPriority 31 'Enter explicitly accepts the next available priority after the source'
+    $resolutionText = ($resolutionRecords | ForEach-Object { [string] $_ }) -join "`n"
+    Assert-Equal ($resolutionText -match 'Source priority 30 is occupied by: Retained') $true 'The panel identifies the exact priority owner'
+    Assert-Equal ($resolutionText -match 'Suggested priority: 31') $true 'The panel explains its proposed new priority'
+    $confirmation = @(Write-DecisionSelection $suggestedDecision 6>&1) -join "`n"
+    Assert-Equal ($confirmation -match "'Suggested' priority 31 \(source was 30\)") $true 'Confirmation distinguishes the changed priority from the original input'
+    Set-SourceDecision $suggestedDecision
+
+    # Invalid answers distinguish bad numbers from occupied priorities, and Q preserves the candidate.
+    Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Cancelled]' `
+        $false $null $true @{ name = 'Cancelled'; priority = 30; ruleType = 'MatchRule'; action = 'Block' } 'name' 'Cancelled'
+    $cancelledDecision = $decisions[5]
+    $cancelledDecision.Choice = 'KeepSource'
+    foreach ($answer in 'invalid', '0', '1001', '100', 'Q') { $script:priorityAnswers.Enqueue($answer) }
+    $cancelRecords = [System.Collections.Generic.List[object]]::new()
+    $cancelled = $false
+    try {
+        Resolve-CustomPriority $cancelledDecision 3>&1 6>&1 | ForEach-Object { $cancelRecords.Add($_) }
+    } catch {
+        if ($_.Exception.Message -cne 'Migration cancelled. No ARM file was written.') { throw }
+        $cancelled = $true
+    }
+    Assert-Equal $cancelled $true 'Q explicitly cancels a priority fix'
+    Assert-Equal $cancelledDecision.SourceValue.priority 30 'Rejected answers and cancellation never mutate the candidate'
+    Assert-Equal $cancelledDecision.ResolvedPriority $null 'Cancelled priority changes are not recorded as accepted'
+    $answerWarnings = @($cancelRecords | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+    Assert-Equal $answerWarnings.Count 4 'Each rejected input emits exactly one distinct warning'
+    Assert-Equal @($answerWarnings | Where-Object Message -Like '*not an integer from 1-1000*').Count 3 'Syntax and out-of-range answers have specific diagnostics'
+    Assert-Equal ($answerWarnings[3].Message -match 'Priority 100 is occupied by ZShared') $true 'Occupied input identifies the reserved rule'
+    $cancelledDecision.Choice = 'KeepTarget'
+
+    # Suggestions wrap at the service limit and skip slots reserved by retained rules.
+    $limitRule = @{ name = 'AtLimit'; priority = 1000; ruleType = 'MatchRule'; action = 'Block' }
+    $firstRule = @{ name = 'AtFirst'; priority = 1; ruleType = 'MatchRule'; action = 'Block' }
+    $target.properties.customRules.rules += @($limitRule, $firstRule)
+    Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Wrapped]' `
+        $false $null $true @{ name = 'Wrapped'; priority = 1000; ruleType = 'MatchRule'; action = 'Block' } 'name' 'Wrapped'
+    $wrappedDecision = $decisions[6]
+    $wrappedDecision.Choice = 'KeepSource'
+    $script:priorityAnswers.Enqueue('')
+    Resolve-CustomPriority $wrappedDecision 3>$null 6>$null
+    Assert-Equal $wrappedDecision.ResolvedPriority 2 'Suggestion wraps from 1000 and skips occupied priority 1'
+    Assert-Equal $script:priorityAnswers.Count 0 'Every scheduled priority answer was consumed'
+
+    # Exhausted slots must fail explicitly before prompting or mutating a candidate.
+    $savedRules = $target.properties.customRules.rules
+    try {
+        $target.properties.customRules.rules = @(
+            foreach ($priority in 1..1000) { @{ name = "Reserved_$priority"; priority = $priority } }
+        )
+        $exhausted = $false
+        try {
+            Resolve-CustomPriority $wrappedDecision
+        } catch {
+            if ($_.Exception.Message -notlike 'No unused priority from 1-1000 is available*') { throw }
+            $exhausted = $true
+        }
+        Assert-Equal $exhausted $true 'No available priority is an explicit error, not an impossible prompt'
+        Assert-Equal $wrappedDecision.SourceValue.priority 2 'An exhausted range does not change the candidate'
+    } finally {
+        $target.properties.customRules.rules = $savedRules
+    }
 } finally {
     Remove-Item -LiteralPath Function:\Read-Host
 }

@@ -116,6 +116,12 @@ merged rules, so a master priority freed by a same-name source selection is not
 reported as occupied. When all custom choices are known, priority resolution
 also reserves the priorities of source rules that will be applied later.
 Retained master rules are never silently removed or renumbered.
+Each conflict has one warning in the table and a separate resolution panel.
+The prompt identifies the rule and current priority owner, and suggests the
+next available priority after the source priority (wrapping within 1-1000).
+Press Enter to accept the suggestion explicitly, enter another unused number,
+or enter `Q` to cancel without writing an ARM template. Invalid entries explain
+whether the number is outside the allowed range or which rule already uses it.
 Invalid source baselines and invalid combinations of selected settings still
 stop generation; automatic mode does not hide validation errors.
 

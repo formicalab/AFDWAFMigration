@@ -2909,7 +2909,7 @@ function Write-DecisionSelection {
     .SYNOPSIS
     Confirms an interactive choice without repeating its comparison or explanation.
     .DESCRIPTION
-    Includes a resolved priority only when selecting the source required a new priority.
+    Includes the rule name and original/resolved priorities only for a priority fix.
     .PARAMETER Item
     Resolved decision, optionally containing a resolved custom-rule priority.
     .OUTPUTS
@@ -2920,7 +2920,9 @@ function Write-DecisionSelection {
         throw "Cannot display an unresolved decision for row $($Item.Id)."
     }
     $text = "[$($Item.Id)] $($Item.Choice)"
-    if ($null -ne $Item.ResolvedPriority) { $text += " (priority $($Item.ResolvedPriority))" }
+    if ($null -ne $Item.ResolvedPriority) {
+        $text += ": '$($Item.IdentityValue)' priority $($Item.ResolvedPriority) (source was $($Item.SourcePriority))"
+    }
     $color = ($Item.Choice -eq 'KeepSource') ? 'Green' : 'Yellow'
     Write-Host $text -ForegroundColor $color
 }
@@ -3440,21 +3442,19 @@ function Write-MigrationBlockingIssues {
         -FlexibleProperty Note -Width (Get-ConsoleWidth) -ForegroundColor Red
 }
 
-function Get-CustomPriorityConflicts {
+function Get-CustomPriorityRules {
     <#
     .SYNOPSIS
-    Finds differently named custom rules occupying a candidate priority.
+    Collects the custom rules reserving priorities for the current review.
     .DESCRIPTION
     Planning overlays preset choices on the target and considers both alternatives
     for pending source decisions. Execution can restrict checks to the current target.
-    .PARAMETER Rule
-    Candidate custom-rule dictionary.
     .PARAMETER CurrentTargetOnly
     Restricts checking to the effective target at execution time.
     .OUTPUTS
-    One sorted array of conflicting custom-rule names.
+    One array of custom-rule dictionaries whose priorities must be reserved.
     #>
-    param([System.Collections.IDictionary] $Rule, [switch] $CurrentTargetOnly)
+    param([switch] $CurrentTargetOnly)
     $rules = Get-Collection $script:target['properties']['customRules'] 'rules'
     if (-not $CurrentTargetOnly) {
         # A selected source replaces its namesake; its old master priority is no longer occupied.
@@ -3467,6 +3467,24 @@ function Get-CustomPriorityConflicts {
             }
         }
     }
+    return ,$rules
+}
+
+function Get-CustomPriorityConflicts {
+    <#
+    .SYNOPSIS
+    Finds differently named custom rules occupying a candidate priority.
+    .DESCRIPTION
+    Uses the same reserved rule collection as interactive priority suggestions.
+    .PARAMETER Rule
+    Candidate custom-rule dictionary.
+    .PARAMETER CurrentTargetOnly
+    Restricts checking to the effective target at execution time.
+    .OUTPUTS
+    One sorted array of conflicting custom-rule names.
+    #>
+    param([System.Collections.IDictionary] $Rule, [switch] $CurrentTargetOnly)
+    $rules = Get-CustomPriorityRules -CurrentTargetOnly:$CurrentTargetOnly
     return ,@($rules | Where-Object {
         $_['name'] -cne $Rule['name'] -and $_['priority'] -eq $Rule['priority']
     } | ForEach-Object { [string] $_['name'] } | Sort-Object -Unique -CaseSensitive)
@@ -3478,7 +3496,8 @@ function Resolve-CustomPriority {
     Resolves an occupied custom-rule priority before applying KeepSource.
     .DESCRIPTION
     Uses the chosen merged rules when all custom choices are known; otherwise checks
-    the current target. Prompts for a conflicting copy and validates 1-1000 and vacancy.
+    the current target. Offers the next available priority after the source priority,
+    wrapping within 1-1000 if needed. Enter explicitly accepts the suggestion.
     Mutates the candidate and records its resolved priority without renumbering master rules.
     .PARAMETER Decision
     KeepSource custom-rule decision; non-custom decisions are unchanged.
@@ -3491,19 +3510,44 @@ function Resolve-CustomPriority {
     $currentTargetOnly = @($decisions | Where-Object { $_.Identity -eq 'name' -and $_.Choice -eq 'Pending' }).Count -gt 0
     $conflicts = Get-CustomPriorityConflicts $Decision.SourceValue -CurrentTargetOnly:$currentTargetOnly
     if ($conflicts.Count -eq 0) { return }
-    Write-Warning "Row $($Decision.Id): '$($Decision.IdentityValue)' needs priority $($Decision.SourceValue['priority']), already used by $($conflicts -join ', '). Retained master rules will not be removed or renumbered."
+
+    # Reserve the same selected rules used by conflict checks, including future source choices.
+    $occupied = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($rule in (Get-CustomPriorityRules -CurrentTargetOnly:$currentTargetOnly)) {
+        if ($rule['name'] -cne $Decision.IdentityValue) { $null = $occupied.Add([int] $rule['priority']) }
+    }
+    $suggestion = 0
+    for ($offset = 1; $offset -lt 1000; $offset++) {
+        $candidatePriority = ([int] $Decision.SourceValue['priority'] + $offset - 1) % 1000 + 1
+        if (-not $occupied.Contains($candidatePriority)) { $suggestion = $candidatePriority; break }
+    }
+    if (-not $suggestion) {
+        throw "No unused priority from 1-1000 is available for '$($Decision.IdentityValue)'. No ARM file was written."
+    }
+
+    # The table already warned about this conflict; the prompt is a resolution step, not another warning.
+    Write-Host "`n[$($Decision.Id)] Resolve custom-rule priority" -ForegroundColor Cyan
+    Write-Host "Rule: '$($Decision.IdentityValue)'"
+    Write-Host "Source priority $($Decision.SourceValue['priority']) is occupied by: $($conflicts -join ', ')."
+    Write-Host "Suggested priority: $suggestion. Lower numbers run first; only this source rule will change."
     do {
-        $answer = (Read-Host "Choose an unused priority (1-1000) for '$($Decision.SourceValue['name'])', or Q to quit").Trim()
+        $answer = (Read-Host "New priority (1-1000), Enter to accept $suggestion, or Q to quit").Trim()
         if ($answer.ToUpperInvariant() -in 'Q', 'QUIT') { throw 'Migration cancelled. No ARM file was written.' }
+        if (-not $answer) { $answer = [string] $suggestion }
         $priority = 0
         $valid = [int]::TryParse($answer, [ref] $priority) -and $priority -ge 1 -and $priority -le 1000
-        if ($valid) {
+        if (-not $valid) {
+            Write-Warning "'$answer' is not an integer from 1-1000. Enter a valid priority or press Enter to accept $suggestion."
+        } else {
             # Probe a copy so rejected priorities never alter the source candidate.
             $candidate = Copy-JsonValue $Decision.SourceValue
             $candidate['priority'] = $priority
-            $valid = (Get-CustomPriorityConflicts $candidate -CurrentTargetOnly:$currentTargetOnly).Count -eq 0
+            $candidateConflicts = Get-CustomPriorityConflicts $candidate -CurrentTargetOnly:$currentTargetOnly
+            $valid = $candidateConflicts.Count -eq 0
+            if (-not $valid) {
+                Write-Warning "Priority $priority is occupied by $($candidateConflicts -join ', '). Try another priority or press Enter to accept $suggestion."
+            }
         }
-        if (-not $valid) { Write-Warning 'Enter an unused integer priority between 1 and 1000.' }
     } until ($valid)
     $Decision.SourceValue['priority'] = $priority
     $Decision.ResolvedPriority = $priority

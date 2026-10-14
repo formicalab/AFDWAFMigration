@@ -19,7 +19,7 @@ foreach ($definition in $ast.FindAll({
 }, $true)) {
     Invoke-Expression $definition.Extent.Text
 }
-foreach ($name in 'apiVersion', 'resourceType', 'drsPath', 'supersededRuleIds', 'retiredRuleIds',
+foreach ($name in 'apiVersion', 'resourceType', 'drsPath', 'supersededRuleIds',
     'actionType', 'stateType', 'wafShapes') {
     $assignment = $ast.Find({
         param($node)
@@ -30,7 +30,7 @@ foreach ($name in 'apiVersion', 'resourceType', 'drsPath', 'supersededRuleIds', 
     if ($null -eq $assignment) { throw "Missing runtime configuration $name." }
     Invoke-Expression $assignment.Extent.Text
 }
-$start = $text.IndexOf('#region Execution - supersession scan and decision planning', [StringComparison]::Ordinal)
+$start = $text.IndexOf('#region Execution - baseline validation and decision planning', [StringComparison]::Ordinal)
 $end = $text.IndexOf('# Choices annotate the report first;', [StringComparison]::Ordinal)
 if ($start -lt 0 -or $end -le $start) { throw 'Cannot locate decision planner.' }
 $planner = $text.Substring($start, $end - $start)
@@ -81,7 +81,6 @@ foreach ($versions in @(@('1.1', '1.0'), @('1.0', '1.1'))) {
     $sourcePolicyName = 'ReportFixture'
     $hasMasterPolicy = $true
     $ReportOnly = $true
-    $UseRecommendedTarget = @()
     $keepSourceRanges = ConvertTo-DecisionRanges @() 'KeepSource'
     $keepTargetRanges = ConvertTo-DecisionRanges @() 'KeepTarget'
     $source = ConvertTo-PolicyConfiguration (New-ReportPolicy $versions[0]) 'Source' -AllowMissingDefaultRuleSet
@@ -162,14 +161,21 @@ foreach ($versions in @(@('1.1', '1.0'), @('1.0', '1.1'))) {
         }
         foreach ($choice in 'Pending', 'KeepSource', 'KeepTarget') {
             $custom.Choice = $choice
-            $records = @(Write-DecisionSummary @($custom) 'Custom rules' 180 3>&1 6>&1)
-            $warnings = @($records | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
-            Assert-Equal $warnings.Count ($(if ($choice -eq 'KeepTarget') { 1 } else { 2 })) 'Priority warnings retain choice-based visibility and compatibility warnings remain visible'
+            $overview = Get-DecisionOverview $custom
+            Assert-Equal $overview.SourcePriority '1' 'Source priority is shown without a misleading transition arrow'
+            Assert-Equal $overview.TargetPriority '2' 'Master priority is a separate input value'
+            Assert-Equal $overview.SelectedPriority ($(switch ($choice) { KeepSource { '1' }; KeepTarget { '2' }; default { 'Pending' } })) 'Selected priority follows the actual choice'
+            foreach ($width in 40, 90, 180) {
+                $records = @(Write-DecisionSummary @($custom) 'Custom rules' $width 3>&1 6>&1)
+                $warnings = @($records | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+                Assert-Equal $warnings.Count ($(if ($choice -eq 'KeepTarget') { 1 } else { 2 })) 'Priority warnings retain choice-based visibility across responsive layouts'
+            }
         }
         $custom.SourceValue = @{}
         $custom.TargetValue = @{}
         $overview = Get-DecisionOverview $custom
-        Assert-Equal $overview.Priority '---' 'Unspecified custom priority uses the common marker'
+        Assert-Equal $overview.SourcePriority '---' 'Unspecified source custom priority uses the common marker'
+        Assert-Equal $overview.TargetPriority '---' 'Unspecified master custom priority uses the common marker'
         Assert-Equal $overview.Type '---' 'Unspecified custom rule type uses the common marker'
         Assert-Equal $overview.Source 'Enabled / ---' 'Unspecified source custom action uses the common marker'
         Assert-Equal $overview.Target 'Enabled / ---' 'Unspecified target custom action uses the common marker'
@@ -177,6 +183,151 @@ foreach ($versions in @(@('1.1', '1.0'), @('1.0', '1.1'))) {
         Assert-Equal @($records | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count 6 'Full report does not repeat inline warnings at the end'
     }
 }
+
+#region Custom priority planning and resolution
+$target = ConvertTo-PolicyConfiguration (New-ReportPolicy '1.1') 'Priority master' -AllowMissingDefaultRuleSet
+$masterShared = @{ name = 'ZShared'; priority = 20; ruleType = 'MatchRule'; action = 'Log' }
+$sourceShared = @{ name = 'ZShared'; priority = 100; ruleType = 'MatchRule'; action = 'Block' }
+$incoming = @{ name = 'EarlyIncoming'; priority = 20; ruleType = 'MatchRule'; action = 'Block' }
+$retained = @{ name = 'Retained'; priority = 30; ruleType = 'MatchRule'; action = 'Block' }
+$target.properties.customRules.rules = @($masterShared, $retained)
+$decisions = [System.Collections.Generic.List[object]]::new()
+Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[EarlyIncoming]' `
+    $false $null $true $incoming 'name' 'EarlyIncoming'
+$incomingDecision = $decisions[0]
+$incomingDecision.Choice = 'KeepSource'
+Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[ZShared]' `
+    $true $masterShared $true $sourceShared 'name' 'ZShared'
+$sharedDecision = $decisions[1]
+$sharedDecision.Choice = 'KeepSource'
+Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Retained]' `
+    $true $retained $false $null 'name' 'Retained' 'TargetCustomRule'
+$retainedDecision = $decisions[2]
+$retainedDecision.Choice = 'KeepTarget'
+
+# Known source choices free master slots and reserve priorities even before mutation.
+Assert-Equal (Get-CustomPriorityConflicts $incoming).Count 0 'A future source replacement frees its old master priority'
+Assert-Equal ((Get-CustomPriorityConflicts @{ name = 'Probe'; priority = 100 }) -join ',') 'ZShared' 'A future source priority is reserved'
+Assert-Equal ((Get-CustomPriorityConflicts @{ name = 'Probe'; priority = 30 }) -join ',') 'Retained' 'Retained master-only rules still conflict'
+$sharedDecision.Choice = 'Pending'
+Assert-Equal ((Get-CustomPriorityConflicts $incoming) -join ',') 'ZShared' 'Pending choices do not prematurely free master slots'
+$sharedDecision.Choice = 'KeepTarget'
+Assert-Equal ((Get-CustomPriorityConflicts $incoming) -join ',') 'ZShared' 'An explicit master choice keeps its priority occupied'
+$sharedDecision.Choice = 'KeepSource'
+$retainedDecision.Choice = 'KeepSource'
+Assert-Equal (Get-CustomPriorityConflicts @{ name = 'Probe'; priority = 30 }).Count 0 'A removed target-only rule releases its priority'
+$retainedDecision.Choice = 'KeepTarget'
+
+$script:priorityAnswers = [System.Collections.Generic.Queue[string]]::new()
+function Read-Host {
+    <#
+    .SYNOPSIS
+    Supplies bounded answers for custom-priority regressions.
+    .DESCRIPTION
+    Throws if priority resolution prompts when no test answer was scheduled.
+    #>
+    param([string] $Prompt)
+    if (-not $script:priorityAnswers.Count) { throw "Unexpected priority prompt: $Prompt" }
+    $script:priorityAnswers.Dequeue()
+}
+try {
+    Resolve-CustomPriority $incomingDecision
+    Assert-Equal $incomingDecision.ResolvedPriority $null 'Freed master slots require neither a prompt nor a fictitious priority resolution'
+    Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Conflicting]' `
+        $false $null $true @{ name = 'Conflicting'; priority = 30; ruleType = 'MatchRule'; action = 'Block' } 'name' 'Conflicting'
+    $conflictingDecision = $decisions[3]
+    $conflictingDecision.Choice = 'KeepSource'
+    $script:priorityAnswers.Enqueue('100')
+    $script:priorityAnswers.Enqueue('21')
+    Resolve-CustomPriority $conflictingDecision 3>$null 6>$null
+    Assert-Equal $script:priorityAnswers.Count 0 'Resolution rejects a priority reserved by a future source choice'
+    Assert-Equal $conflictingDecision.SourcePriority 30 'Resolution retains the original source priority for comparison'
+    Assert-Equal $conflictingDecision.ResolvedPriority 21 'Only the conflicting source rule receives the approved new priority'
+    $overview = Get-DecisionOverview $conflictingDecision
+    Assert-Equal $overview.SourcePriority '30' 'Post-resolution display retains the original input priority'
+    Assert-Equal $overview.SelectedPriority '21' 'Post-resolution display shows the actual chosen priority'
+    foreach ($decision in @($incomingDecision, $conflictingDecision, $sharedDecision)) {
+        Set-SourceDecision $decision
+    }
+    Assert-Equal @($target.properties.customRules.rules.priority | Sort-Object -Unique).Count 4 'The selected custom-rule union has unique priorities'
+    Assert-Equal $retained.priority 30 'Priority resolution never renumbers retained master rules'
+
+    # Accepting a suggestion produces a resolution panel, not a second warning about the same row.
+    Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Suggested]' `
+        $false $null $true @{ name = 'Suggested'; priority = 30; ruleType = 'MatchRule'; action = 'Block' } 'name' 'Suggested'
+    $suggestedDecision = $decisions[4]
+    $suggestedDecision.Choice = 'KeepSource'
+    $script:priorityAnswers.Enqueue('')
+    $resolutionRecords = @(Resolve-CustomPriority $suggestedDecision 3>&1 6>&1)
+    Assert-Equal @($resolutionRecords | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count 0 'A valid priority fix does not repeat the comparison warning'
+    Assert-Equal $suggestedDecision.ResolvedPriority 31 'Enter explicitly accepts the next available priority after the source'
+    $resolutionText = ($resolutionRecords | ForEach-Object { [string] $_ }) -join "`n"
+    Assert-Equal ($resolutionText -match 'Source priority 30 is occupied by: Retained') $true 'The panel identifies the exact priority owner'
+    Assert-Equal ($resolutionText -match 'Suggested priority: 31') $true 'The panel explains its proposed new priority'
+    $confirmation = @(Write-DecisionSelection $suggestedDecision 6>&1) -join "`n"
+    Assert-Equal ($confirmation -match "'Suggested' priority 31 \(source was 30\)") $true 'Confirmation distinguishes the changed priority from the original input'
+    Set-SourceDecision $suggestedDecision
+
+    # Invalid answers distinguish bad numbers from occupied priorities, and Q preserves the candidate.
+    Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Cancelled]' `
+        $false $null $true @{ name = 'Cancelled'; priority = 30; ruleType = 'MatchRule'; action = 'Block' } 'name' 'Cancelled'
+    $cancelledDecision = $decisions[5]
+    $cancelledDecision.Choice = 'KeepSource'
+    foreach ($answer in 'invalid', '0', '1001', '100', 'Q') { $script:priorityAnswers.Enqueue($answer) }
+    $cancelRecords = [System.Collections.Generic.List[object]]::new()
+    $cancelled = $false
+    try {
+        Resolve-CustomPriority $cancelledDecision 3>&1 6>&1 | ForEach-Object { $cancelRecords.Add($_) }
+    } catch {
+        if ($_.Exception.Message -cne 'Migration cancelled. No ARM file was written.') { throw }
+        $cancelled = $true
+    }
+    Assert-Equal $cancelled $true 'Q explicitly cancels a priority fix'
+    Assert-Equal $cancelledDecision.SourceValue.priority 30 'Rejected answers and cancellation never mutate the candidate'
+    Assert-Equal $cancelledDecision.ResolvedPriority $null 'Cancelled priority changes are not recorded as accepted'
+    $answerWarnings = @($cancelRecords | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+    Assert-Equal $answerWarnings.Count 4 'Each rejected input emits exactly one distinct warning'
+    Assert-Equal @($answerWarnings | Where-Object Message -Like '*not an integer from 1-1000*').Count 3 'Syntax and out-of-range answers have specific diagnostics'
+    Assert-Equal ($answerWarnings[3].Message -match 'Priority 100 is occupied by ZShared') $true 'Occupied input identifies the reserved rule'
+    $cancelledDecision.Choice = 'KeepTarget'
+
+    # Suggestions wrap at the service limit and skip slots reserved by retained rules.
+    $limitRule = @{ name = 'AtLimit'; priority = 1000; ruleType = 'MatchRule'; action = 'Block' }
+    $firstRule = @{ name = 'AtFirst'; priority = 1; ruleType = 'MatchRule'; action = 'Block' }
+    $target.properties.customRules.rules += @($limitRule, $firstRule)
+    Add-Decision $target.properties.customRules 'rules' 'properties.customRules.rules[Wrapped]' `
+        $false $null $true @{ name = 'Wrapped'; priority = 1000; ruleType = 'MatchRule'; action = 'Block' } 'name' 'Wrapped'
+    $wrappedDecision = $decisions[6]
+    $wrappedDecision.Choice = 'KeepSource'
+    $script:priorityAnswers.Enqueue('')
+    Resolve-CustomPriority $wrappedDecision 3>$null 6>$null
+    Assert-Equal $wrappedDecision.ResolvedPriority 2 'Suggestion wraps from 1000 and skips occupied priority 1'
+    Assert-Equal $script:priorityAnswers.Count 0 'Every scheduled priority answer was consumed'
+
+    # Exhausted slots must fail explicitly before prompting or mutating a candidate.
+    $savedRules = $target.properties.customRules.rules
+    try {
+        $target.properties.customRules.rules = @(
+            foreach ($priority in 1..1000) { @{ name = "Reserved_$priority"; priority = $priority } }
+        )
+        $exhausted = $false
+        try {
+            Resolve-CustomPriority $wrappedDecision
+        } catch {
+            if ($_.Exception.Message -notlike 'No unused priority from 1-1000 is available*') { throw }
+            $exhausted = $true
+        }
+        Assert-Equal $exhausted $true 'No available priority is an explicit error, not an impossible prompt'
+        Assert-Equal $wrappedDecision.SourceValue.priority 2 'An exhausted range does not change the candidate'
+    } finally {
+        $target.properties.customRules.rules = $savedRules
+    }
+} finally {
+    Remove-Item -LiteralPath Function:\Read-Host
+}
+Write-Host 'PASS: distinct input/selected priorities, choice-aware collisions, freed slots and future-priority reservations'
+#endregion
+
 $unspecifiedPolicy = New-ReportPolicy '1.1'
 $null = $unspecifiedPolicy.properties.Remove('policySettings')
 $configuration = ConvertTo-PolicyConfiguration $unspecifiedPolicy 'Unspecified fixture' -AllowMissingDefaultRuleSet
@@ -186,4 +337,53 @@ Assert-Equal $rule.PolicyMode '---' 'Unspecified policy mode uses the common mar
 Assert-Equal $rule.RuleSetAction '---' 'Unspecified Bot Manager scope action uses the common marker'
 Assert-Equal $rule.State 'Enabled' 'Unspecified policy metadata does not disable native rules'
 Write-Host 'PASS: tag labels/privacy/absence, bidirectional bot metadata, and inline warnings across responsive layouts'
+#endregion
+
+#region Front Door exclusion selector semantics
+foreach ($variable in 'RequestHeaderNames', 'RequestCookieNames', 'QueryStringArgNames',
+    'RequestBodyPostArgNames', 'RequestBodyJsonArgNames') {
+    foreach ($operator in 'Equals', 'Contains', 'StartsWith', 'EndsWith') {
+        $left = @{ matchVariable = $variable; selectorMatchOperator = $operator; selector = 'MixedCase' }
+        $right = Copy-JsonValue $left
+        $right.selector = 'mixedcase'
+        $caseInsensitive = $variable -cin 'RequestHeaderNames', 'RequestCookieNames'
+        Assert-Equal (Test-JsonEqual $left $right 'exclusion') $caseInsensitive "$variable/$operator uses native selector case semantics"
+        Assert-Equal (Test-JsonEqual @($left) @($right) 'exclusions') $caseInsensitive "$variable/$operator uses the same semantics for exclusion arrays"
+        Assert-Equal (Test-JsonEqual @{ exclusions = @($left) } @{ exclusions = @($right) }) $caseInsensitive "$variable/$operator uses the same semantics in nested configuration"
+        Assert-Equal $left.selector 'MixedCase' 'Comparison preserves the source selector spelling'
+        Assert-Equal $right.selector 'mixedcase' 'Comparison preserves the target selector spelling'
+        Assert-Equal (Test-JsonEqual @($left, $left) @($right) 'exclusions') $false 'Selector canonicalization does not collapse duplicate occurrences'
+    }
+}
+
+foreach ($scope in 'Rule set', 'Rule group', 'Individual rule') {
+    $sourceOriginalDrsVersion = '2.2'
+    $sourcePolicy = New-ReportPolicy '1.1'
+    $sourceSet = @{
+        ruleSetType = 'Microsoft_DefaultRuleSet'; ruleSetVersion = '2.2'; ruleSetAction = 'Block'
+        ruleGroupOverrides = @()
+    }
+    $exclusion = @{ matchVariable = 'RequestHeaderNames'; selectorMatchOperator = 'Equals'; selector = 'X-Token' }
+    switch ($scope) {
+        'Rule set' { $sourceSet.exclusions = @($exclusion) }
+        'Rule group' { $sourceSet.ruleGroupOverrides = @(@{ ruleGroupName = 'SQLI'; exclusions = @($exclusion); rules = @() }) }
+        'Individual rule' {
+            $sourceSet.ruleGroupOverrides = @(@{
+                ruleGroupName = 'SQLI'; rules = @(@{ ruleId = '942100'; exclusions = @($exclusion) })
+            })
+        }
+    }
+    $sourcePolicy.properties.managedRules.managedRuleSets = @($sourceSet)
+    $source = ConvertTo-PolicyConfiguration $sourcePolicy 'Source' -AllowMissingDefaultRuleSet
+    $target = Copy-JsonValue $source
+    $targetEntries = Get-DrsExclusionEntries $target
+    $targetEntries[0].Exclusion.selector = 'x-token'
+    $decisions = [System.Collections.Generic.List[object]]::new()
+    Invoke-Expression $planner
+    Assert-Equal $decisions.Count 0 "$scope case-equivalent exclusions produce no decisions or rule risks"
+    $sourceEntries = Get-DrsExclusionEntries $drsSourceSnapshot
+    Assert-Equal $sourceEntries[0].Exclusion.selector 'X-Token' "$scope planning preserves source selector spelling"
+    Assert-Equal $targetEntries[0].Exclusion.selector 'x-token' "$scope planning preserves target selector spelling"
+}
+Write-Host 'PASS: native exclusion selector case semantics, scoped planning, duplicates and input preservation'
 #endregion
